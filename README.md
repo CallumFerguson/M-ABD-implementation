@@ -1,21 +1,32 @@
-# M-ABD 10x10 ball-joint net
+# M-ABD joint-net demos
 
-A focused proof-of-concept implementation of the ball-joint net from Figure 12
-of *M-ABD: Scalable, Efficient, and Robust Multi-Affine-Body Dynamics*.
+A focused proof-of-concept implementation of the ball-joint nets from
+*M-ABD: Scalable, Efficient, and Robust Multi-Affine-Body Dynamics*.
 
-The scene contains the paper's inferred 280-body topology:
+The application has three scenes that can be changed at runtime:
+
+- `1`: the original edge-pinned 10x10 joint grid
+- `2`: the edge-pinned joint grid draped over a static cylinder
+- `3`: a horizontal, four-corner-pinned joint grid catching three falling balls
+- `R`: reset the current scene
+- `30`, `60`, `120`, `200`, and `500` Hz buttons: change the fixed simulation
+  rate without resetting the scene
+
+Each net contains the paper's inferred 280-body topology:
 
 - 100 affine hub bodies arranged in a 10x10 grid
 - 180 affine rod bodies joining horizontal and vertical neighbors
 - 360 ball joints, or 1,080 scalar positional constraints
-- 10 fixed hub bodies along the top boundary
+- either 10 fixed hubs along one edge or four fixed corner hubs
 
 Each affine body is represented by the four control points from Section 4.1.
 Each fixed step performs an implicit prediction and a compact co-rotated
 local/global solve, using a matrix-free dual KKT solve for all linear ball-joint
-constraints. The demo uses the Figure 12 timestep of `1/30 s`. A compact overlay
-reports smoothed FPS and frame time, the measured simulation-step duration,
-simulation rate, and scene size.
+constraints. Primitive sphere/capsule contacts provide two-way interaction with
+the cylinder and falling balls. The default timestep is the Figure 12 value of
+`1/30 s`; the on-screen controls can change it up to `1/500 s` at runtime. A
+compact overlay reports the active scene, smoothed FPS and frame time, measured
+simulation-step duration, fixed rate, and scene size.
 
 ## Run natively
 
@@ -47,7 +58,9 @@ trunk build --release
 
 ## MVP scope
 
-This demo includes only the paper mechanics needed for Figure 12: co-rotated
-affine bodies, fixed-step implicit prediction, linear ball joints, and a dual
-constraint solve. It intentionally omits contacts, self-collision, other joint
-types, controls, GPU compute, and the paper's million-body solver optimizations.
+This demo includes co-rotated affine bodies, fixed-step implicit prediction,
+linear ball joints, a dual constraint solve, and deliberately narrow analytic
+contacts for spheres, rod capsules, and one static cylinder. It intentionally
+omits friction, restitution, continuous collision detection, self-collision,
+arbitrary mesh collision, other joint types, controls, GPU compute, and the
+paper's million-body solver optimizations.

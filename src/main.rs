@@ -8,26 +8,58 @@ use bevy::window::{PresentMode, WindowResolution};
 
 const GRID_SIZE: usize = 10;
 const GRID_SPACING: f64 = 0.55;
-const FIXED_HZ: f64 = 30.0;
-const FIXED_DT: f64 = 1.0 / FIXED_HZ;
+const DEFAULT_FIXED_HZ: f64 = 30.0;
+const FIXED_HZ_OPTIONS: [f64; 5] = [30.0, 60.0, 120.0, 200.0, 500.0];
 const GRAVITY: DVec3 = DVec3::new(0.0, -9.81, 0.0);
-const VELOCITY_DAMPING: f64 = 0.997;
+const VELOCITY_DAMPING_AT_DEFAULT_HZ: f64 = 0.997;
 const AFFINE_STIFFNESS: f64 = 12_000.0;
 const DUAL_TOLERANCE: f64 = 1.0e-7;
 const MAX_PCG_ITERATIONS: usize = 100;
 const COROTATED_ITERATIONS: usize = 24;
+const CONTACT_PASSES: usize = 2;
 
 const HUB_RADIUS: f32 = 0.075;
 const ROD_THICKNESS: f32 = 0.055;
+const ROD_LENGTH_FACTOR: f32 = 0.78;
+const BALL_RADIUS: f32 = 0.34;
+const CYLINDER_RADIUS: f32 = 0.70;
+const CYLINDER_LENGTH: f32 = 5.80;
+const CONTACT_EPSILON: f64 = 1.0e-12;
 
 const HUB_CENTER: [f64; 4] = [0.25, 0.25, 0.25, 0.25];
 const ROD_START: [f64; 4] = [0.5, 0.5, 0.0, 0.0];
 const ROD_END: [f64; 4] = [0.0, 0.0, 0.5, 0.5];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DemoScene {
+    JointGrid,
+    CylinderDrape,
+    FallingBalls,
+}
+
+impl DemoScene {
+    fn number(self) -> usize {
+        match self {
+            Self::JointGrid => 1,
+            Self::CylinderDrape => 2,
+            Self::FallingBalls => 3,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::JointGrid => "Joint grid",
+            Self::CylinderDrape => "Cylinder drape",
+            Self::FallingBalls => "Falling balls",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BodyKind {
     Hub { fixed: bool },
     Rod,
+    Ball,
 }
 
 struct AffineBody {
@@ -85,7 +117,7 @@ impl AffineBody {
         closest_rotation(covariance * self.rest_covariance_inverse)
     }
 
-    fn predict(&mut self) {
+    fn predict(&mut self, dt: f64) {
         self.previous_positions = self.positions;
 
         if self.fixed {
@@ -95,23 +127,22 @@ impl AffineBody {
             return;
         }
 
-        let inertia = self.mass_per_point / (FIXED_DT * FIXED_DT);
+        let inertia = self.mass_per_point / (dt * dt);
         self.inverse_diagonal = 1.0 / (inertia + self.stiffness);
 
         for index in 0..4 {
-            self.predicted_positions[index] = self.positions[index]
-                + self.velocities[index] * FIXED_DT
-                + GRAVITY * (FIXED_DT * FIXED_DT);
+            self.predicted_positions[index] =
+                self.positions[index] + self.velocities[index] * dt + GRAVITY * (dt * dt);
             self.positions[index] = self.predicted_positions[index];
         }
     }
 
-    fn project_corotated_shape(&mut self) {
+    fn project_corotated_shape(&mut self, dt: f64) {
         if self.fixed {
             return;
         }
 
-        let inertia = self.mass_per_point / (FIXED_DT * FIXED_DT);
+        let inertia = self.mass_per_point / (dt * dt);
         let center = self.centroid();
         let rotation = self.rotation();
 
@@ -123,17 +154,22 @@ impl AffineBody {
         }
     }
 
-    fn finish_step(&mut self) {
+    fn finish_step(&mut self, dt: f64) {
         if self.fixed {
             self.velocities = [DVec3::ZERO; 4];
             return;
         }
 
+        let velocity_damping = velocity_damping_for_dt(dt);
         for index in 0..4 {
-            self.velocities[index] = (self.positions[index] - self.previous_positions[index])
-                * (VELOCITY_DAMPING / FIXED_DT);
+            self.velocities[index] =
+                (self.positions[index] - self.previous_positions[index]) * (velocity_damping / dt);
         }
     }
+}
+
+fn velocity_damping_for_dt(dt: f64) -> f64 {
+    VELOCITY_DAMPING_AT_DEFAULT_HZ.powf(dt * DEFAULT_FIXED_HZ)
 }
 
 #[derive(Clone, Copy)]
@@ -148,10 +184,20 @@ struct BallJoint {
     b: Attachment,
 }
 
+#[derive(Clone, Copy)]
+struct CylinderCollider {
+    origin: DVec3,
+    axis: DVec3,
+    radius: f64,
+}
+
 #[derive(Resource)]
 struct NetSimulation {
+    scene: DemoScene,
     bodies: Vec<AffineBody>,
     joints: Vec<BallJoint>,
+    cylinder: Option<CylinderCollider>,
+    ball_indices: Vec<usize>,
 }
 
 #[derive(Resource, Default)]
@@ -160,18 +206,34 @@ struct SimulationTiming {
 }
 
 impl NetSimulation {
-    fn new() -> Self {
-        let mut bodies = Vec::with_capacity(3 * GRID_SIZE * GRID_SIZE - 2 * GRID_SIZE);
+    fn new(scene: DemoScene) -> Self {
+        let mut bodies = Vec::with_capacity(3 * GRID_SIZE * GRID_SIZE - 2 * GRID_SIZE + 3);
         let mut joints = Vec::with_capacity(4 * GRID_SIZE * (GRID_SIZE - 1));
         let mut hubs = [[0usize; GRID_SIZE]; GRID_SIZE];
         let mut node_positions = [[DVec3::ZERO; GRID_SIZE]; GRID_SIZE];
         let hub_rest_points = hub_rest_points();
+        let grid_height = if scene == DemoScene::FallingBalls {
+            1.70
+        } else {
+            3.0
+        };
 
         for row in 0..GRID_SIZE {
             for column in 0..GRID_SIZE {
                 let x = (column as f64 - (GRID_SIZE - 1) as f64 * 0.5) * GRID_SPACING;
-                let position = DVec3::new(x, 3.0, -(row as f64) * GRID_SPACING);
-                let fixed = row == 0;
+                let z = if scene == DemoScene::FallingBalls {
+                    (row as f64 - (GRID_SIZE - 1) as f64 * 0.5) * GRID_SPACING
+                } else {
+                    -(row as f64) * GRID_SPACING
+                };
+                let position = DVec3::new(x, grid_height, z);
+                let fixed = match scene {
+                    DemoScene::JointGrid | DemoScene::CylinderDrape => row == 0,
+                    DemoScene::FallingBalls => {
+                        (row == 0 || row == GRID_SIZE - 1)
+                            && (column == 0 || column == GRID_SIZE - 1)
+                    }
+                };
                 let body_index = bodies.len();
 
                 node_positions[row][column] = position;
@@ -216,17 +278,48 @@ impl NetSimulation {
         debug_assert_eq!(bodies.len(), 280);
         debug_assert_eq!(joints.len(), 360);
 
-        Self { bodies, joints }
+        let cylinder = (scene == DemoScene::CylinderDrape).then_some(CylinderCollider {
+            origin: DVec3::new(0.0, 1.75, -2.30),
+            axis: DVec3::X,
+            radius: CYLINDER_RADIUS as f64,
+        });
+        let mut ball_indices = Vec::new();
+
+        if scene == DemoScene::FallingBalls {
+            for position in [
+                DVec3::new(-1.10, 2.80, -0.80),
+                DVec3::new(0.85, 3.15, -0.25),
+                DVec3::new(-0.20, 3.50, 1.05),
+            ] {
+                ball_indices.push(bodies.len());
+                bodies.push(AffineBody::new(
+                    BodyKind::Ball,
+                    ball_rest_points(),
+                    position,
+                    DQuat::IDENTITY,
+                    1.2,
+                    false,
+                ));
+            }
+        }
+
+        Self {
+            scene,
+            bodies,
+            joints,
+            cylinder,
+            ball_indices,
+        }
     }
 
-    fn step(&mut self) {
+    fn step(&mut self, dt: f64) {
         for body in &mut self.bodies {
-            body.predict();
+            body.predict(dt);
         }
 
         for _ in 0..COROTATED_ITERATIONS {
             for body in &mut self.bodies {
-                body.project_corotated_shape();
+                body.project_corotated_shape(dt);
             }
 
             let constraint_residual: Vec<DVec3> = self
@@ -240,10 +333,25 @@ impl NetSimulation {
 
             let multipliers = solve_dual_pcg(&self.bodies, &self.joints, &constraint_residual);
             apply_joint_correction(&mut self.bodies, &self.joints, &multipliers);
+
+            for _ in 0..CONTACT_PASSES {
+                match self.scene {
+                    DemoScene::JointGrid => {}
+                    DemoScene::CylinderDrape => {
+                        project_cylinder_contacts(
+                            &mut self.bodies,
+                            self.cylinder.expect("cylinder scene must have a collider"),
+                        );
+                    }
+                    DemoScene::FallingBalls => {
+                        project_ball_contacts(&mut self.bodies, &self.ball_indices);
+                    }
+                }
+            }
         }
 
         for body in &mut self.bodies {
-            body.finish_step();
+            body.finish_step(dt);
         }
     }
 }
@@ -252,17 +360,39 @@ impl NetSimulation {
 struct BodyVisual(usize);
 
 #[derive(Component)]
+struct SceneVisual;
+
+#[derive(Component)]
+struct MainCamera;
+
+#[derive(Component)]
 struct PerformanceOverlay;
+
+#[derive(Component)]
+struct FixedHzButton(f64);
+
+#[derive(Resource)]
+struct VisualAssets {
+    hub_mesh: Handle<Mesh>,
+    rod_mesh: Handle<Mesh>,
+    ball_mesh: Handle<Mesh>,
+    cylinder_mesh: Handle<Mesh>,
+    hub_material: Handle<StandardMaterial>,
+    rod_material: Handle<StandardMaterial>,
+    fixed_material: Handle<StandardMaterial>,
+    ball_material: Handle<StandardMaterial>,
+    cylinder_material: Handle<StandardMaterial>,
+}
 
 fn main() {
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.012, 0.018, 0.03)))
-        .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
-        .insert_resource(NetSimulation::new())
+        .insert_resource(Time::<Fixed>::from_hz(DEFAULT_FIXED_HZ))
+        .insert_resource(NetSimulation::new(DemoScene::JointGrid))
         .init_resource::<SimulationTiming>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "M-ABD 10x10 Joint Net".into(),
+                title: "M-ABD Joint Net Demos".into(),
                 resolution: WindowResolution::new(1100, 700),
                 present_mode: PresentMode::AutoVsync,
                 canvas: Some("#bevy-canvas".into()),
@@ -275,7 +405,18 @@ fn main() {
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_systems(Startup, setup_scene)
         .add_systems(FixedUpdate, step_simulation)
-        .add_systems(Update, (sync_body_visuals, update_performance_overlay))
+        .add_systems(
+            Update,
+            (
+                switch_demo_scene,
+                change_fixed_hz,
+                style_fixed_hz_buttons,
+                ApplyDeferred,
+                sync_body_visuals,
+                update_performance_overlay,
+            )
+                .chain(),
+        )
         .run();
 }
 
@@ -285,46 +426,49 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let hub_mesh = meshes.add(Sphere::new(HUB_RADIUS));
-    let rod_mesh = meshes.add(Cuboid::new(
-        GRID_SPACING as f32 * 0.78,
-        ROD_THICKNESS,
-        ROD_THICKNESS,
-    ));
+    let assets = VisualAssets {
+        hub_mesh: meshes.add(Sphere::new(HUB_RADIUS)),
+        rod_mesh: meshes.add(Cuboid::new(
+            GRID_SPACING as f32 * ROD_LENGTH_FACTOR,
+            ROD_THICKNESS,
+            ROD_THICKNESS,
+        )),
+        ball_mesh: meshes.add(Sphere::new(BALL_RADIUS)),
+        cylinder_mesh: meshes.add(Cylinder::new(CYLINDER_RADIUS, CYLINDER_LENGTH)),
+        hub_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.56, 0.65, 0.76),
+            metallic: 0.55,
+            perceptual_roughness: 0.28,
+            ..default()
+        }),
+        rod_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.38, 0.46, 0.58),
+            metallic: 0.65,
+            perceptual_roughness: 0.24,
+            ..default()
+        }),
+        fixed_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.04, 0.55, 0.95),
+            metallic: 0.25,
+            perceptual_roughness: 0.2,
+            ..default()
+        }),
+        ball_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.96, 0.29, 0.08),
+            metallic: 0.08,
+            perceptual_roughness: 0.32,
+            ..default()
+        }),
+        cylinder_material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.56, 0.22, 0.07),
+            metallic: 0.04,
+            perceptual_roughness: 0.62,
+            ..default()
+        }),
+    };
 
-    let hub_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.56, 0.65, 0.76),
-        metallic: 0.55,
-        perceptual_roughness: 0.28,
-        ..default()
-    });
-    let rod_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.38, 0.46, 0.58),
-        metallic: 0.65,
-        perceptual_roughness: 0.24,
-        ..default()
-    });
-    let fixed_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.04, 0.55, 0.95),
-        metallic: 0.25,
-        perceptual_roughness: 0.2,
-        ..default()
-    });
-
-    for (index, body) in simulation.bodies.iter().enumerate() {
-        let (mesh, material) = match body.kind {
-            BodyKind::Hub { fixed: true } => (hub_mesh.clone(), fixed_material.clone()),
-            BodyKind::Hub { fixed: false } => (hub_mesh.clone(), hub_material.clone()),
-            BodyKind::Rod => (rod_mesh.clone(), rod_material.clone()),
-        };
-
-        commands.spawn((
-            Mesh3d(mesh),
-            MeshMaterial3d(material),
-            body_transform(body),
-            BodyVisual(index),
-        ));
-    }
+    spawn_scene_visuals(&mut commands, &simulation, &assets);
+    commands.insert_resource(assets);
 
     commands.spawn((
         PointLight {
@@ -338,13 +482,14 @@ fn setup_scene(
 
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(7.2, 3.8, 10.5).looking_at(Vec3::new(0.0, 0.6, -1.8), Vec3::Y),
+        camera_transform(simulation.scene),
+        MainCamera,
     ));
 
     commands.spawn((
-        Text::new(
-            "FPS       --\nFRAME     -- ms\nSIM STEP  -- ms\nSIM       30 Hz\n280 bodies | 360 joints",
-        ),
+        Text::new(format!(
+            "SCENE 1/3  Joint grid\nFPS       --\nFRAME     -- ms\nSIM STEP  -- ms\nFIXED    {DEFAULT_FIXED_HZ:>5.0} Hz\n280 bodies | 360 joints\n[1] Grid  [2] Cylinder  [3] Balls  [R] Reset"
+        )),
         TextFont {
             font_size: FontSize::Px(15.0),
             ..default()
@@ -362,11 +507,176 @@ fn setup_scene(
         BackgroundColor(Color::srgba(0.015, 0.025, 0.045, 0.82)),
         PerformanceOverlay,
     ));
+
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                right: px(16.0),
+                bottom: px(16.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px(8.0),
+                padding: UiRect::axes(px(12.0), px(9.0)),
+                border_radius: BorderRadius::all(px(8.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.015, 0.025, 0.045, 0.82)),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("FIXED HZ"),
+                TextFont {
+                    font_size: FontSize::Px(14.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.70, 0.77, 0.89)),
+            ));
+
+            for hz in FIXED_HZ_OPTIONS {
+                parent
+                    .spawn((
+                        Button,
+                        FixedHzButton(hz),
+                        Node {
+                            width: px(50.0),
+                            height: px(32.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(px(6.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.09, 0.14, 0.22)),
+                    ))
+                    .with_child((
+                        Text::new(format!("{hz:.0}")),
+                        TextFont {
+                            font_size: FontSize::Px(14.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.88, 0.92, 1.0)),
+                    ));
+            }
+        });
 }
 
-fn step_simulation(mut simulation: ResMut<NetSimulation>, mut timing: ResMut<SimulationTiming>) {
+fn spawn_scene_visuals(commands: &mut Commands, simulation: &NetSimulation, assets: &VisualAssets) {
+    for (index, body) in simulation.bodies.iter().enumerate() {
+        let (mesh, material) = match body.kind {
+            BodyKind::Hub { fixed: true } => {
+                (assets.hub_mesh.clone(), assets.fixed_material.clone())
+            }
+            BodyKind::Hub { fixed: false } => {
+                (assets.hub_mesh.clone(), assets.hub_material.clone())
+            }
+            BodyKind::Rod => (assets.rod_mesh.clone(), assets.rod_material.clone()),
+            BodyKind::Ball => (assets.ball_mesh.clone(), assets.ball_material.clone()),
+        };
+
+        commands.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            body_transform(body),
+            BodyVisual(index),
+            SceneVisual,
+        ));
+    }
+
+    if let Some(cylinder) = simulation.cylinder {
+        commands.spawn((
+            Mesh3d(assets.cylinder_mesh.clone()),
+            MeshMaterial3d(assets.cylinder_material.clone()),
+            Transform::from_translation(cylinder.origin.as_vec3())
+                .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
+            SceneVisual,
+        ));
+    }
+}
+
+fn switch_demo_scene(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut commands: Commands,
+    mut simulation: ResMut<NetSimulation>,
+    mut timing: ResMut<SimulationTiming>,
+    assets: Res<VisualAssets>,
+    scene_visuals: Query<Entity, With<SceneVisual>>,
+    mut camera: Query<&mut Transform, With<MainCamera>>,
+) {
+    let target = if keys.just_pressed(KeyCode::Digit1) {
+        DemoScene::JointGrid
+    } else if keys.just_pressed(KeyCode::Digit2) {
+        DemoScene::CylinderDrape
+    } else if keys.just_pressed(KeyCode::Digit3) {
+        DemoScene::FallingBalls
+    } else if keys.just_pressed(KeyCode::KeyR) {
+        simulation.scene
+    } else {
+        return;
+    };
+
+    for entity in &scene_visuals {
+        commands.entity(entity).despawn();
+    }
+
+    let next_simulation = NetSimulation::new(target);
+    spawn_scene_visuals(&mut commands, &next_simulation, &assets);
+    *simulation = next_simulation;
+    *timing = SimulationTiming::default();
+
+    if let Ok(mut transform) = camera.single_mut() {
+        *transform = camera_transform(target);
+    }
+}
+
+fn change_fixed_hz(
+    mut fixed_time: ResMut<Time<Fixed>>,
+    buttons: Query<(&Interaction, &FixedHzButton), Changed<Interaction>>,
+) {
+    for (interaction, button) in &buttons {
+        if *interaction == Interaction::Pressed {
+            fixed_time.set_timestep_hz(button.0);
+        }
+    }
+}
+
+fn style_fixed_hz_buttons(
+    fixed_time: Res<Time<Fixed>>,
+    mut buttons: Query<(&Interaction, &FixedHzButton, &mut BackgroundColor)>,
+) {
+    let current_hz = 1.0 / fixed_time.timestep().as_secs_f64();
+
+    for (interaction, button, mut background) in &mut buttons {
+        let selected = (button.0 - current_hz).abs() < 0.5;
+        *background = match *interaction {
+            Interaction::Pressed => Color::srgb(0.16, 0.58, 0.96).into(),
+            Interaction::Hovered => Color::srgb(0.15, 0.27, 0.43).into(),
+            Interaction::None if selected => Color::srgb(0.04, 0.48, 0.86).into(),
+            Interaction::None => Color::srgb(0.09, 0.14, 0.22).into(),
+        };
+    }
+}
+
+fn camera_transform(scene: DemoScene) -> Transform {
+    match scene {
+        DemoScene::JointGrid => {
+            Transform::from_xyz(7.2, 4.6, 10.5).looking_at(Vec3::new(0.0, 0.7, -2.2), Vec3::Y)
+        }
+        DemoScene::CylinderDrape => {
+            Transform::from_xyz(7.2, 5.0, 10.5).looking_at(Vec3::new(0.0, 1.6, -2.3), Vec3::Y)
+        }
+        DemoScene::FallingBalls => {
+            Transform::from_xyz(7.4, 5.7, 8.8).looking_at(Vec3::new(0.0, 1.8, 0.0), Vec3::Y)
+        }
+    }
+}
+
+fn step_simulation(
+    fixed_time: Res<Time<Fixed>>,
+    mut simulation: ResMut<NetSimulation>,
+    mut timing: ResMut<SimulationTiming>,
+) {
     let start = Instant::now();
-    simulation.step();
+    simulation.step(fixed_time.timestep().as_secs_f64());
     timing.latest_step_ms = start.elapsed().as_secs_f64() * 1_000.0;
 }
 
@@ -375,32 +685,36 @@ fn sync_body_visuals(
     mut visuals: Query<(&BodyVisual, &mut Transform)>,
 ) {
     for (visual, mut transform) in &mut visuals {
-        *transform = body_transform(&simulation.bodies[visual.0]);
+        if let Some(body) = simulation.bodies.get(visual.0) {
+            *transform = body_transform(body);
+        }
     }
 }
 
 fn update_performance_overlay(
     diagnostics: Res<DiagnosticsStore>,
+    fixed_time: Res<Time<Fixed>>,
     simulation: Res<NetSimulation>,
     timing: Res<SimulationTiming>,
     mut overlays: Query<&mut Text, With<PerformanceOverlay>>,
 ) {
-    let Some(fps) = diagnostics
+    let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|diagnostic| diagnostic.smoothed())
-    else {
-        return;
-    };
-    let Some(frame_time) = diagnostics
+        .map(|value| format!("{value:>5.1}"))
+        .unwrap_or_else(|| "   --".into());
+    let frame_time = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
         .and_then(|diagnostic| diagnostic.smoothed())
-    else {
-        return;
-    };
+        .map(|value| format!("{value:>5.2}"))
+        .unwrap_or_else(|| "   --".into());
+    let fixed_hz = 1.0 / fixed_time.timestep().as_secs_f64();
 
     for mut text in &mut overlays {
         text.0 = format!(
-            "FPS      {fps:>5.1}\nFRAME    {frame_time:>5.2} ms\nSIM STEP {:>5.2} ms\nSIM      {FIXED_HZ:.0} Hz\n{} bodies | {} joints",
+            "SCENE {}/3  {}\nFPS      {fps}\nFRAME    {frame_time} ms\nSIM STEP {:>5.2} ms\nFIXED    {fixed_hz:>5.0} Hz\n{} bodies | {} joints\n[1] Grid  [2] Cylinder  [3] Balls  [R] Reset",
+            simulation.scene.number(),
+            simulation.scene.title(),
             timing.latest_step_ms,
             simulation.bodies.len(),
             simulation.joints.len(),
@@ -461,6 +775,262 @@ fn add_rod(
             weights: HUB_CENTER,
         },
     });
+}
+
+fn project_cylinder_contacts(bodies: &mut [AffineBody], cylinder: CylinderCollider) {
+    let axis = cylinder.axis.normalize_or_zero();
+    if axis.length_squared() <= CONTACT_EPSILON {
+        return;
+    }
+
+    for body_index in 0..bodies.len() {
+        match bodies[body_index].kind {
+            BodyKind::Hub { .. } => project_attachment_against_cylinder(
+                bodies,
+                Attachment {
+                    body: body_index,
+                    weights: HUB_CENTER,
+                },
+                HUB_RADIUS as f64,
+                cylinder.origin,
+                axis,
+                cylinder.radius,
+            ),
+            BodyKind::Rod => {
+                let (start, end) = rod_collider_attachments(body_index);
+                let start_position = attachment_position(bodies, start);
+                let end_position = attachment_position(bodies, end);
+                let start_radial = reject_from_axis(start_position - cylinder.origin, axis);
+                let direction_radial = reject_from_axis(end_position - start_position, axis);
+                let denominator = direction_radial.length_squared();
+                let t = if denominator > CONTACT_EPSILON {
+                    (-start_radial.dot(direction_radial) / denominator).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+
+                project_attachment_against_cylinder(
+                    bodies,
+                    interpolate_attachment(start, end, t),
+                    ROD_THICKNESS as f64 * 0.5,
+                    cylinder.origin,
+                    axis,
+                    cylinder.radius,
+                );
+            }
+            BodyKind::Ball => {}
+        }
+    }
+}
+
+fn project_attachment_against_cylinder(
+    bodies: &mut [AffineBody],
+    attachment: Attachment,
+    proxy_radius: f64,
+    cylinder_origin: DVec3,
+    cylinder_axis: DVec3,
+    cylinder_radius: f64,
+) {
+    let position = attachment_position(bodies, attachment);
+    let radial = reject_from_axis(position - cylinder_origin, cylinder_axis);
+    let distance = radial.length();
+    let penetration = cylinder_radius + proxy_radius - distance;
+    if penetration <= 0.0 {
+        return;
+    }
+
+    let previous = previous_attachment_position(bodies, attachment);
+    let previous_radial = reject_from_axis(previous - cylinder_origin, cylinder_axis);
+    let fallback = perpendicular_to(cylinder_axis);
+    let normal = safe_normal(radial, previous_radial, fallback);
+    project_static_attachment(bodies, attachment, normal, penetration);
+}
+
+fn project_ball_contacts(bodies: &mut [AffineBody], ball_indices: &[usize]) {
+    for first in 0..ball_indices.len() {
+        for second in (first + 1)..ball_indices.len() {
+            let a = Attachment {
+                body: ball_indices[first],
+                weights: HUB_CENTER,
+            };
+            let b = Attachment {
+                body: ball_indices[second],
+                weights: HUB_CENTER,
+            };
+            let fallback = match (first + second) % 3 {
+                0 => DVec3::X,
+                1 => DVec3::Y,
+                _ => DVec3::Z,
+            };
+            project_attachment_pair(bodies, a, b, BALL_RADIUS as f64 * 2.0, fallback);
+        }
+    }
+
+    let net_body_count = ball_indices.first().copied().unwrap_or(bodies.len());
+    for &ball_index in ball_indices {
+        let ball_center = Attachment {
+            body: ball_index,
+            weights: HUB_CENTER,
+        };
+
+        for net_body_index in 0..net_body_count {
+            match bodies[net_body_index].kind {
+                BodyKind::Hub { .. } => project_attachment_pair(
+                    bodies,
+                    ball_center,
+                    Attachment {
+                        body: net_body_index,
+                        weights: HUB_CENTER,
+                    },
+                    BALL_RADIUS as f64 + HUB_RADIUS as f64,
+                    DVec3::Y,
+                ),
+                BodyKind::Rod => {
+                    let (start, end) = rod_collider_attachments(net_body_index);
+                    let sphere_position = attachment_position(bodies, ball_center);
+                    let start_position = attachment_position(bodies, start);
+                    let end_position = attachment_position(bodies, end);
+                    let direction = end_position - start_position;
+                    let denominator = direction.length_squared();
+                    let t = if denominator > CONTACT_EPSILON {
+                        ((sphere_position - start_position).dot(direction) / denominator)
+                            .clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    };
+
+                    project_attachment_pair(
+                        bodies,
+                        ball_center,
+                        interpolate_attachment(start, end, t),
+                        BALL_RADIUS as f64 + ROD_THICKNESS as f64 * 0.5,
+                        DVec3::Y,
+                    );
+                }
+                BodyKind::Ball => {}
+            }
+        }
+    }
+}
+
+fn project_attachment_pair(
+    bodies: &mut [AffineBody],
+    a: Attachment,
+    b: Attachment,
+    minimum_distance: f64,
+    fallback: DVec3,
+) {
+    if a.body == b.body {
+        return;
+    }
+
+    let delta = attachment_position(bodies, a) - attachment_position(bodies, b);
+    let distance = delta.length();
+    let penetration = minimum_distance - distance;
+    if penetration <= 0.0 {
+        return;
+    }
+
+    let previous_delta =
+        previous_attachment_position(bodies, a) - previous_attachment_position(bodies, b);
+    let normal = safe_normal(delta, previous_delta, fallback);
+    let a_inverse_weight = attachment_inverse_weight(bodies, a);
+    let b_inverse_weight = attachment_inverse_weight(bodies, b);
+    let denominator = a_inverse_weight + b_inverse_weight;
+    if denominator <= CONTACT_EPSILON {
+        return;
+    }
+
+    let multiplier = penetration / denominator;
+    apply_attachment_position_delta(bodies, a, normal, multiplier);
+    apply_attachment_position_delta(bodies, b, -normal, multiplier);
+}
+
+fn project_static_attachment(
+    bodies: &mut [AffineBody],
+    attachment: Attachment,
+    normal: DVec3,
+    penetration: f64,
+) {
+    let inverse_weight = attachment_inverse_weight(bodies, attachment);
+    if inverse_weight <= CONTACT_EPSILON {
+        return;
+    }
+
+    apply_attachment_position_delta(bodies, attachment, normal, penetration / inverse_weight);
+}
+
+fn apply_attachment_position_delta(
+    bodies: &mut [AffineBody],
+    attachment: Attachment,
+    direction: DVec3,
+    multiplier: f64,
+) {
+    let body = &mut bodies[attachment.body];
+    if body.fixed {
+        return;
+    }
+
+    let scale = body.inverse_diagonal * multiplier;
+    for (position, weight) in body.positions.iter_mut().zip(attachment.weights) {
+        *position += direction * (scale * weight);
+    }
+}
+
+fn rod_collider_attachments(body: usize) -> (Attachment, Attachment) {
+    let trim = (1.0 - ROD_LENGTH_FACTOR as f64) * 0.5;
+    let start = Attachment {
+        body,
+        weights: ROD_START,
+    };
+    let end = Attachment {
+        body,
+        weights: ROD_END,
+    };
+    (
+        interpolate_attachment(start, end, trim),
+        interpolate_attachment(start, end, 1.0 - trim),
+    )
+}
+
+fn interpolate_attachment(a: Attachment, b: Attachment, t: f64) -> Attachment {
+    debug_assert_eq!(a.body, b.body);
+    Attachment {
+        body: a.body,
+        weights: std::array::from_fn(|index| {
+            a.weights[index] + (b.weights[index] - a.weights[index]) * t
+        }),
+    }
+}
+
+fn previous_attachment_position(bodies: &[AffineBody], attachment: Attachment) -> DVec3 {
+    weighted_point(
+        &bodies[attachment.body].previous_positions,
+        attachment.weights,
+    )
+}
+
+fn reject_from_axis(vector: DVec3, axis: DVec3) -> DVec3 {
+    vector - axis * vector.dot(axis)
+}
+
+fn perpendicular_to(axis: DVec3) -> DVec3 {
+    let candidate = if axis.y.abs() < 0.9 {
+        DVec3::Y
+    } else {
+        DVec3::X
+    };
+    reject_from_axis(candidate, axis).normalize_or_zero()
+}
+
+fn safe_normal(primary: DVec3, secondary: DVec3, fallback: DVec3) -> DVec3 {
+    if primary.length_squared() > CONTACT_EPSILON {
+        primary.normalize()
+    } else if secondary.length_squared() > CONTACT_EPSILON {
+        secondary.normalize()
+    } else {
+        fallback.normalize_or_zero()
+    }
 }
 
 fn solve_dual_pcg(
@@ -624,6 +1194,17 @@ fn hub_rest_points() -> [DVec3; 4] {
     ]
 }
 
+fn ball_rest_points() -> [DVec3; 4] {
+    let radius = BALL_RADIUS as f64;
+    let scale = radius / 3.0_f64.sqrt();
+    [
+        DVec3::new(1.0, 1.0, 1.0) * scale,
+        DVec3::new(1.0, -1.0, -1.0) * scale,
+        DVec3::new(-1.0, 1.0, -1.0) * scale,
+        DVec3::new(-1.0, -1.0, 1.0) * scale,
+    ]
+}
+
 fn rod_rest_points() -> [DVec3; 4] {
     let half_length = GRID_SPACING * 0.5;
     let radius = ROD_THICKNESS as f64 * 0.5;
@@ -674,7 +1255,7 @@ mod tests {
 
     #[test]
     fn builds_the_papers_10_by_10_topology() {
-        let simulation = NetSimulation::new();
+        let simulation = NetSimulation::new(DemoScene::JointGrid);
         let fixed_hubs = simulation.bodies.iter().filter(|body| body.fixed).count();
 
         assert_eq!(simulation.bodies.len(), 280);
@@ -684,10 +1265,10 @@ mod tests {
 
     #[test]
     fn ball_joints_remain_closed_under_gravity() {
-        let mut simulation = NetSimulation::new();
+        let mut simulation = NetSimulation::new(DemoScene::JointGrid);
 
         for _ in 0..30 {
-            simulation.step();
+            simulation.step(1.0 / DEFAULT_FIXED_HZ);
         }
 
         let maximum_gap = simulation
@@ -721,5 +1302,355 @@ mod tests {
             maximum_shape_error < 0.05,
             "maximum affine shape error: {maximum_shape_error}"
         );
+    }
+
+    #[test]
+    fn builds_all_three_demo_scenes() {
+        let grid = NetSimulation::new(DemoScene::JointGrid);
+        let cylinder = NetSimulation::new(DemoScene::CylinderDrape);
+        let balls = NetSimulation::new(DemoScene::FallingBalls);
+
+        assert_eq!(grid.bodies.len(), 280);
+        assert_eq!(grid.bodies.iter().filter(|body| body.fixed).count(), 10);
+        assert!(grid.cylinder.is_none());
+        assert!(grid.ball_indices.is_empty());
+
+        assert_eq!(cylinder.bodies.len(), 280);
+        assert_eq!(cylinder.bodies.iter().filter(|body| body.fixed).count(), 10);
+        assert!(cylinder.cylinder.is_some());
+        assert!(cylinder.ball_indices.is_empty());
+
+        assert_eq!(balls.bodies.len(), 283);
+        assert_eq!(balls.bodies.iter().filter(|body| body.fixed).count(), 4);
+        assert!(balls.cylinder.is_none());
+        assert_eq!(balls.ball_indices.len(), 3);
+        assert_eq!(balls.joints.len(), 360);
+    }
+
+    #[test]
+    fn supported_fixed_rates_update_time_and_preserve_damping() {
+        let expected_one_second_damping = VELOCITY_DAMPING_AT_DEFAULT_HZ.powf(DEFAULT_FIXED_HZ);
+
+        for hz in FIXED_HZ_OPTIONS {
+            let mut fixed_time = Time::<Fixed>::from_hz(DEFAULT_FIXED_HZ);
+            fixed_time.set_timestep_hz(hz);
+            let dt = fixed_time.timestep().as_secs_f64();
+            let measured_hz = 1.0 / dt;
+            let one_second_damping = velocity_damping_for_dt(dt).powf(measured_hz);
+
+            assert!((measured_hz - hz).abs() < 1.0e-4);
+            assert!((one_second_damping - expected_one_second_damping).abs() < 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn contact_scenes_remain_finite_at_supported_fixed_rates() {
+        for hz in FIXED_HZ_OPTIONS {
+            let dt = 1.0 / hz;
+            let step_count = (2.0 * hz) as usize;
+
+            for scene in [DemoScene::CylinderDrape, DemoScene::FallingBalls] {
+                let mut simulation = NetSimulation::new(scene);
+                for _ in 0..step_count {
+                    simulation.step(dt);
+                }
+                assert!(
+                    simulation_is_finite(&simulation),
+                    "{} became non-finite at {hz} Hz",
+                    scene.title()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pair_contact_separates_two_dynamic_attachments() {
+        let mut bodies = vec![
+            test_body(DVec3::ZERO, false),
+            test_body(DVec3::new(0.5, 0.0, 0.0), false),
+        ];
+        let first = Attachment {
+            body: 0,
+            weights: HUB_CENTER,
+        };
+        let second = Attachment {
+            body: 1,
+            weights: HUB_CENTER,
+        };
+
+        project_attachment_pair(&mut bodies, first, second, 1.0, DVec3::X);
+
+        let delta = attachment_position(&bodies, first) - attachment_position(&bodies, second);
+        assert!((delta.length() - 1.0).abs() < 1.0e-10);
+        assert!((bodies[0].centroid().x + 0.25).abs() < 1.0e-10);
+        assert!((bodies[1].centroid().x - 0.75).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn static_cylinder_contact_projects_outward() {
+        let cylinder = CylinderCollider {
+            origin: DVec3::ZERO,
+            axis: DVec3::X,
+            radius: 0.7,
+        };
+        let mut bodies = vec![test_body(DVec3::new(0.0, 0.2, 0.0), false)];
+
+        project_cylinder_contacts(&mut bodies, cylinder);
+
+        let radial = reject_from_axis(bodies[0].centroid(), cylinder.axis).length();
+        assert!((radial - (cylinder.radius + HUB_RADIUS as f64)).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn sphere_capsule_contact_handles_midpoint_and_endcap() {
+        for sphere_position in [DVec3::new(0.0, 0.2, 0.0), DVec3::new(0.35, 0.1, 0.0)] {
+            let mut rod = AffineBody::new(
+                BodyKind::Rod,
+                rod_rest_points(),
+                DVec3::ZERO,
+                DQuat::IDENTITY,
+                1.0,
+                false,
+            );
+            rod.inverse_diagonal = 1.0;
+            let mut ball = AffineBody::new(
+                BodyKind::Ball,
+                ball_rest_points(),
+                sphere_position,
+                DQuat::IDENTITY,
+                1.0,
+                false,
+            );
+            ball.inverse_diagonal = 1.0;
+            let mut bodies = vec![rod, ball];
+
+            project_ball_contacts(&mut bodies, &[1]);
+
+            let separation = sphere_rod_separation(&bodies, 1, 0);
+            assert!(separation.abs() < 1.0e-10, "separation: {separation}");
+        }
+    }
+
+    #[test]
+    fn coincident_spheres_use_a_finite_fallback_normal() {
+        let mut bodies = (0..2)
+            .map(|_| {
+                let mut body = AffineBody::new(
+                    BodyKind::Ball,
+                    ball_rest_points(),
+                    DVec3::ZERO,
+                    DQuat::IDENTITY,
+                    1.0,
+                    false,
+                );
+                body.inverse_diagonal = 1.0;
+                body
+            })
+            .collect::<Vec<_>>();
+
+        project_ball_contacts(&mut bodies, &[0, 1]);
+
+        let distance = (bodies[0].centroid() - bodies[1].centroid()).length();
+        assert!(bodies.iter().all(|body| body.centroid().is_finite()));
+        assert!((distance - BALL_RADIUS as f64 * 2.0).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn cylinder_scene_settles_without_penetration() {
+        let mut simulation = NetSimulation::new(DemoScene::CylinderDrape);
+        let cylinder = simulation.cylinder.unwrap();
+
+        for _ in 0..120 {
+            simulation.step(1.0 / DEFAULT_FIXED_HZ);
+        }
+
+        let minimum_separation = simulation
+            .bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(index, body)| {
+                cylinder_proxy_separation(&simulation.bodies, index, body, cylinder)
+            })
+            .fold(f64::INFINITY, f64::min);
+        let maximum_gap = maximum_joint_gap(&simulation);
+
+        assert!(simulation_is_finite(&simulation));
+        assert!(
+            minimum_separation >= -1.0e-6,
+            "minimum separation: {minimum_separation}"
+        );
+        assert!(maximum_gap < 5.0e-3, "maximum joint gap: {maximum_gap}");
+    }
+
+    #[test]
+    fn falling_balls_are_supported_by_the_corner_pinned_net() {
+        let mut simulation = NetSimulation::new(DemoScene::FallingBalls);
+        let fixed_positions: Vec<[DVec3; 4]> = simulation
+            .bodies
+            .iter()
+            .filter(|body| body.fixed)
+            .map(|body| body.positions)
+            .collect();
+
+        for _ in 0..150 {
+            simulation.step(1.0 / DEFAULT_FIXED_HZ);
+        }
+
+        let lowest_net_height = simulation.bodies[..280]
+            .iter()
+            .map(AffineBody::centroid)
+            .map(|position| position.y)
+            .fold(f64::INFINITY, f64::min);
+        let lowest_ball_height = simulation
+            .ball_indices
+            .iter()
+            .map(|&index| simulation.bodies[index].centroid().y)
+            .fold(f64::INFINITY, f64::min);
+        let final_fixed_positions: Vec<[DVec3; 4]> = simulation
+            .bodies
+            .iter()
+            .filter(|body| body.fixed)
+            .map(|body| body.positions)
+            .collect();
+        assert!(simulation_is_finite(&simulation));
+        assert_eq!(fixed_positions, final_fixed_positions);
+        assert!(
+            lowest_ball_height > lowest_net_height - BALL_RADIUS as f64,
+            "balls passed through the net: ball={lowest_ball_height}, net={lowest_net_height}"
+        );
+        let minimum_contact_separation = minimum_ball_contact_separation(&simulation);
+        assert!(
+            minimum_contact_separation >= -2.0e-2,
+            "minimum ball contact separation: {minimum_contact_separation}"
+        );
+        assert!(maximum_joint_gap(&simulation) < 5.0e-3);
+    }
+
+    fn test_body(position: DVec3, fixed: bool) -> AffineBody {
+        let mut body = AffineBody::new(
+            BodyKind::Hub { fixed },
+            hub_rest_points(),
+            position,
+            DQuat::IDENTITY,
+            1.0,
+            fixed,
+        );
+        body.inverse_diagonal = if fixed { 0.0 } else { 1.0 };
+        body
+    }
+
+    fn maximum_joint_gap(simulation: &NetSimulation) -> f64 {
+        simulation
+            .joints
+            .iter()
+            .map(|joint| {
+                (attachment_position(&simulation.bodies, joint.a)
+                    - attachment_position(&simulation.bodies, joint.b))
+                .length()
+            })
+            .fold(0.0, f64::max)
+    }
+
+    fn simulation_is_finite(simulation: &NetSimulation) -> bool {
+        simulation.bodies.iter().all(|body| {
+            body.positions
+                .iter()
+                .chain(&body.velocities)
+                .all(|value| value.is_finite())
+        })
+    }
+
+    fn cylinder_proxy_separation(
+        bodies: &[AffineBody],
+        body_index: usize,
+        body: &AffineBody,
+        cylinder: CylinderCollider,
+    ) -> Option<f64> {
+        let (attachment, radius) = match body.kind {
+            BodyKind::Hub { .. } => (
+                Attachment {
+                    body: body_index,
+                    weights: HUB_CENTER,
+                },
+                HUB_RADIUS as f64,
+            ),
+            BodyKind::Rod => {
+                let (start, end) = rod_collider_attachments(body_index);
+                let start_position = attachment_position(bodies, start);
+                let end_position = attachment_position(bodies, end);
+                let start_radial =
+                    reject_from_axis(start_position - cylinder.origin, cylinder.axis);
+                let direction_radial =
+                    reject_from_axis(end_position - start_position, cylinder.axis);
+                let denominator = direction_radial.length_squared();
+                let t = if denominator > CONTACT_EPSILON {
+                    (-start_radial.dot(direction_radial) / denominator).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                (
+                    interpolate_attachment(start, end, t),
+                    ROD_THICKNESS as f64 * 0.5,
+                )
+            }
+            BodyKind::Ball => return None,
+        };
+        let radial = reject_from_axis(
+            attachment_position(bodies, attachment) - cylinder.origin,
+            cylinder.axis,
+        )
+        .length();
+        Some(radial - cylinder.radius - radius)
+    }
+
+    fn sphere_rod_separation(bodies: &[AffineBody], sphere: usize, rod: usize) -> f64 {
+        let sphere_position = bodies[sphere].centroid();
+        let (start, end) = rod_collider_attachments(rod);
+        let start_position = attachment_position(bodies, start);
+        let end_position = attachment_position(bodies, end);
+        let direction = end_position - start_position;
+        let denominator = direction.length_squared();
+        let t = if denominator > CONTACT_EPSILON {
+            ((sphere_position - start_position).dot(direction) / denominator).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let closest = attachment_position(bodies, interpolate_attachment(start, end, t));
+        (sphere_position - closest).length() - BALL_RADIUS as f64 - ROD_THICKNESS as f64 * 0.5
+    }
+
+    fn minimum_ball_contact_separation(simulation: &NetSimulation) -> f64 {
+        let mut minimum = f64::INFINITY;
+
+        for first in 0..simulation.ball_indices.len() {
+            let first_index = simulation.ball_indices[first];
+            for second in (first + 1)..simulation.ball_indices.len() {
+                let second_index = simulation.ball_indices[second];
+                minimum = minimum.min(
+                    (simulation.bodies[first_index].centroid()
+                        - simulation.bodies[second_index].centroid())
+                    .length()
+                        - BALL_RADIUS as f64 * 2.0,
+                );
+            }
+
+            for net_index in 0..simulation.ball_indices[0] {
+                minimum = minimum.min(match simulation.bodies[net_index].kind {
+                    BodyKind::Hub { .. } => {
+                        (simulation.bodies[first_index].centroid()
+                            - simulation.bodies[net_index].centroid())
+                        .length()
+                            - BALL_RADIUS as f64
+                            - HUB_RADIUS as f64
+                    }
+                    BodyKind::Rod => {
+                        sphere_rod_separation(&simulation.bodies, first_index, net_index)
+                    }
+                    BodyKind::Ball => f64::INFINITY,
+                });
+            }
+        }
+
+        minimum
     }
 }
