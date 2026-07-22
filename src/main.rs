@@ -6,6 +6,10 @@ use bevy::text::FontSize;
 use bevy::time::Fixed;
 use bevy::window::{PresentMode, WindowResolution};
 
+mod physx_demo;
+
+use physx_demo::PhysxDemo;
+
 const GRID_SIZE: usize = 10;
 const GRID_SPACING: f64 = 0.55;
 const DEFAULT_FIXED_HZ: f64 = 30.0;
@@ -17,6 +21,7 @@ const DUAL_TOLERANCE: f64 = 1.0e-7;
 const MAX_PCG_ITERATIONS: usize = 100;
 const COROTATED_ITERATIONS: usize = 24;
 const CONTACT_PASSES: usize = 2;
+const DEMO_COUNT: usize = 4;
 
 const HUB_RADIUS: f32 = 0.075;
 const ROD_THICKNESS: f32 = 0.055;
@@ -35,6 +40,7 @@ enum DemoScene {
     JointGrid,
     CylinderDrape,
     FallingBalls,
+    PhysxDrop,
 }
 
 impl DemoScene {
@@ -43,6 +49,7 @@ impl DemoScene {
             Self::JointGrid => 1,
             Self::CylinderDrape => 2,
             Self::FallingBalls => 3,
+            Self::PhysxDrop => 4,
         }
     }
 
@@ -51,9 +58,17 @@ impl DemoScene {
             Self::JointGrid => "Joint grid",
             Self::CylinderDrape => "Cylinder drape",
             Self::FallingBalls => "Falling balls",
+            Self::PhysxDrop => "PhysX cube drop",
         }
     }
+
+    fn is_mabd(self) -> bool {
+        self != Self::PhysxDrop
+    }
 }
+
+#[derive(Resource)]
+struct ActiveDemo(DemoScene);
 
 #[derive(Clone, Copy)]
 enum BodyKind {
@@ -207,6 +222,7 @@ struct SimulationTiming {
 
 impl NetSimulation {
     fn new(scene: DemoScene) -> Self {
+        assert!(scene.is_mabd(), "PhysX does not use NetSimulation");
         let mut bodies = Vec::with_capacity(3 * GRID_SIZE * GRID_SIZE - 2 * GRID_SIZE + 3);
         let mut joints = Vec::with_capacity(4 * GRID_SIZE * (GRID_SIZE - 1));
         let mut hubs = [[0usize; GRID_SIZE]; GRID_SIZE];
@@ -233,6 +249,7 @@ impl NetSimulation {
                         (row == 0 || row == GRID_SIZE - 1)
                             && (column == 0 || column == GRID_SIZE - 1)
                     }
+                    DemoScene::PhysxDrop => unreachable!(),
                 };
                 let body_index = bodies.len();
 
@@ -346,6 +363,7 @@ impl NetSimulation {
                     DemoScene::FallingBalls => {
                         project_ball_contacts(&mut self.bodies, &self.ball_indices);
                     }
+                    DemoScene::PhysxDrop => unreachable!(),
                 }
             }
         }
@@ -358,6 +376,9 @@ impl NetSimulation {
 
 #[derive(Component)]
 struct BodyVisual(usize);
+
+#[derive(Component)]
+struct PhysxCubeVisual;
 
 #[derive(Component)]
 struct SceneVisual;
@@ -377,6 +398,8 @@ struct VisualAssets {
     rod_mesh: Handle<Mesh>,
     ball_mesh: Handle<Mesh>,
     cylinder_mesh: Handle<Mesh>,
+    physx_cube_mesh: Handle<Mesh>,
+    physx_ground_mesh: Handle<Mesh>,
     hub_material: Handle<StandardMaterial>,
     rod_material: Handle<StandardMaterial>,
     fixed_material: Handle<StandardMaterial>,
@@ -385,9 +408,11 @@ struct VisualAssets {
 }
 
 fn main() {
-    App::new()
+    let mut app = App::new();
+    app.insert_non_send(PhysxDemo::new())
         .insert_resource(ClearColor(Color::srgb(0.012, 0.018, 0.03)))
         .insert_resource(Time::<Fixed>::from_hz(DEFAULT_FIXED_HZ))
+        .insert_resource(ActiveDemo(DemoScene::JointGrid))
         .insert_resource(NetSimulation::new(DemoScene::JointGrid))
         .init_resource::<SimulationTiming>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -404,7 +429,7 @@ fn main() {
         }))
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_systems(Startup, setup_scene)
-        .add_systems(FixedUpdate, step_simulation)
+        .add_systems(FixedUpdate, (step_simulation, step_physx_simulation))
         .add_systems(
             Update,
             (
@@ -413,11 +438,12 @@ fn main() {
                 style_fixed_hz_buttons,
                 ApplyDeferred,
                 sync_body_visuals,
+                sync_physx_visual,
                 update_performance_overlay,
             )
                 .chain(),
-        )
-        .run();
+        );
+    app.run();
 }
 
 fn setup_scene(
@@ -435,6 +461,8 @@ fn setup_scene(
         )),
         ball_mesh: meshes.add(Sphere::new(BALL_RADIUS)),
         cylinder_mesh: meshes.add(Cylinder::new(CYLINDER_RADIUS, CYLINDER_LENGTH)),
+        physx_cube_mesh: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
+        physx_ground_mesh: meshes.add(Cuboid::new(6.0, 1.0, 6.0)),
         hub_material: materials.add(StandardMaterial {
             base_color: Color::srgb(0.56, 0.65, 0.76),
             metallic: 0.55,
@@ -488,7 +516,7 @@ fn setup_scene(
 
     commands.spawn((
         Text::new(format!(
-            "SCENE 1/3  Joint grid\nFPS       --\nFRAME     -- ms\nSIM STEP  -- ms\nFIXED    {DEFAULT_FIXED_HZ:>5.0} Hz\n280 bodies | 360 joints\n[1] Grid  [2] Cylinder  [3] Balls  [R] Reset"
+            "SCENE 1/{DEMO_COUNT}  Joint grid\nFPS       --\nFRAME     -- ms\nSIM STEP  -- ms\nFIXED    {DEFAULT_FIXED_HZ:>5.0} Hz\n280 bodies | 360 joints\n[1] Grid  [2] Cylinder  [3] Balls  [4] PhysX  [R] Reset"
         )),
         TextFont {
             font_size: FontSize::Px(15.0),
@@ -593,10 +621,28 @@ fn spawn_scene_visuals(commands: &mut Commands, simulation: &NetSimulation, asse
     }
 }
 
+fn spawn_physx_visuals(commands: &mut Commands, physx: &PhysxDemo, assets: &VisualAssets) {
+    commands.spawn((
+        Mesh3d(assets.physx_ground_mesh.clone()),
+        MeshMaterial3d(assets.fixed_material.clone()),
+        Transform::from_xyz(0.0, -0.5, 0.0),
+        SceneVisual,
+    ));
+    commands.spawn((
+        Mesh3d(assets.physx_cube_mesh.clone()),
+        MeshMaterial3d(assets.ball_material.clone()),
+        physx.cube_transform(),
+        PhysxCubeVisual,
+        SceneVisual,
+    ));
+}
+
 fn switch_demo_scene(
     keys: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
+    mut active: ResMut<ActiveDemo>,
     mut simulation: ResMut<NetSimulation>,
+    mut physx: NonSendMut<PhysxDemo>,
     mut timing: ResMut<SimulationTiming>,
     assets: Res<VisualAssets>,
     scene_visuals: Query<Entity, With<SceneVisual>>,
@@ -608,8 +654,10 @@ fn switch_demo_scene(
         DemoScene::CylinderDrape
     } else if keys.just_pressed(KeyCode::Digit3) {
         DemoScene::FallingBalls
+    } else if keys.just_pressed(KeyCode::Digit4) {
+        DemoScene::PhysxDrop
     } else if keys.just_pressed(KeyCode::KeyR) {
-        simulation.scene
+        active.0
     } else {
         return;
     };
@@ -618,9 +666,15 @@ fn switch_demo_scene(
         commands.entity(entity).despawn();
     }
 
-    let next_simulation = NetSimulation::new(target);
-    spawn_scene_visuals(&mut commands, &next_simulation, &assets);
-    *simulation = next_simulation;
+    if target.is_mabd() {
+        let next_simulation = NetSimulation::new(target);
+        spawn_scene_visuals(&mut commands, &next_simulation, &assets);
+        *simulation = next_simulation;
+    } else {
+        physx.reset();
+        spawn_physx_visuals(&mut commands, &physx, &assets);
+    }
+    active.0 = target;
     *timing = SimulationTiming::default();
 
     if let Ok(mut transform) = camera.single_mut() {
@@ -667,16 +721,39 @@ fn camera_transform(scene: DemoScene) -> Transform {
         DemoScene::FallingBalls => {
             Transform::from_xyz(7.4, 5.7, 8.8).looking_at(Vec3::new(0.0, 1.8, 0.0), Vec3::Y)
         }
+        DemoScene::PhysxDrop => {
+            Transform::from_xyz(6.0, 4.2, 7.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y)
+        }
     }
 }
 
 fn step_simulation(
     fixed_time: Res<Time<Fixed>>,
+    active: Res<ActiveDemo>,
     mut simulation: ResMut<NetSimulation>,
     mut timing: ResMut<SimulationTiming>,
 ) {
+    if !active.0.is_mabd() {
+        return;
+    }
+
     let start = Instant::now();
     simulation.step(fixed_time.timestep().as_secs_f64());
+    timing.latest_step_ms = start.elapsed().as_secs_f64() * 1_000.0;
+}
+
+fn step_physx_simulation(
+    fixed_time: Res<Time<Fixed>>,
+    active: Res<ActiveDemo>,
+    mut physx: NonSendMut<PhysxDemo>,
+    mut timing: ResMut<SimulationTiming>,
+) {
+    if active.0 != DemoScene::PhysxDrop {
+        return;
+    }
+
+    let start = Instant::now();
+    physx.step(fixed_time.timestep().as_secs_f32());
     timing.latest_step_ms = start.elapsed().as_secs_f64() * 1_000.0;
 }
 
@@ -691,10 +768,21 @@ fn sync_body_visuals(
     }
 }
 
+fn sync_physx_visual(
+    physx: NonSend<PhysxDemo>,
+    mut visuals: Query<&mut Transform, With<PhysxCubeVisual>>,
+) {
+    for mut transform in &mut visuals {
+        *transform = physx.cube_transform();
+    }
+}
+
 fn update_performance_overlay(
     diagnostics: Res<DiagnosticsStore>,
     fixed_time: Res<Time<Fixed>>,
+    active: Res<ActiveDemo>,
     simulation: Res<NetSimulation>,
+    physx: NonSend<PhysxDemo>,
     timing: Res<SimulationTiming>,
     mut overlays: Query<&mut Text, With<PerformanceOverlay>>,
 ) {
@@ -709,15 +797,26 @@ fn update_performance_overlay(
         .map(|value| format!("{value:>5.2}"))
         .unwrap_or_else(|| "   --".into());
     let fixed_hz = 1.0 / fixed_time.timestep().as_secs_f64();
+    let (body_count, joint_count, backend_status) = if active.0 == DemoScene::PhysxDrop {
+        (2, 0, format!("\nPHYSX   {}", physx.status()))
+    } else {
+        (
+            simulation.bodies.len(),
+            simulation.joints.len(),
+            String::new(),
+        )
+    };
 
     for mut text in &mut overlays {
         text.0 = format!(
-            "SCENE {}/3  {}\nFPS      {fps}\nFRAME    {frame_time} ms\nSIM STEP {:>5.2} ms\nFIXED    {fixed_hz:>5.0} Hz\n{} bodies | {} joints\n[1] Grid  [2] Cylinder  [3] Balls  [R] Reset",
-            simulation.scene.number(),
-            simulation.scene.title(),
+            "SCENE {}/{}  {}\nFPS      {fps}\nFRAME    {frame_time} ms\nSIM STEP {:>5.2} ms\nFIXED    {fixed_hz:>5.0} Hz\n{} bodies | {} joints{}\n[1] Grid  [2] Cylinder  [3] Balls  [4] PhysX  [R] Reset",
+            active.0.number(),
+            DEMO_COUNT,
+            active.0.title(),
             timing.latest_step_ms,
-            simulation.bodies.len(),
-            simulation.joints.len(),
+            body_count,
+            joint_count,
+            backend_status,
         );
     }
 }

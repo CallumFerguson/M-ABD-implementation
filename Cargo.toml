@@ -7,6 +7,13 @@ description = "A minimal M-ABD 10x10 ball-joint net demo for native and web targ
 [dependencies]
 bevy = "0.19"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+physx = "0.19"
+physx-sys = "0.11.5"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
 # Keep development builds responsive while still compiling this crate quickly.
 [profile.dev]
 opt-level = 1

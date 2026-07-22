@@ -1,0 +1,11 @@
+{
+  "name": "m-abd-joint-net-web",
+  "private": true,
+  "scripts": {
+    "build": "trunk build --release",
+    "serve": "trunk serve"
+  },
+  "dependencies": {
+    "physx-js-webidl": "2.7.3"
+  }
+}

@@ -5,10 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Three M-ABD joint-net demos simulated by Bevy in WebAssembly."
+      content="Three M-ABD joint-net demos and a PhysX cube drop running in Bevy WebAssembly."
     />
-    <title>M-ABD Joint-Net Demos</title>
+    <title>M-ABD and PhysX Demos</title>
     <link data-trunk rel="rust" data-cargo-no-default-features="false" />
+    <link
+      data-trunk
+      rel="copy-file"
+      href="node_modules/physx-js-webidl/physx-js-webidl.mjs"
+    />
+    <link
+      data-trunk
+      rel="copy-file"
+      href="node_modules/physx-js-webidl/physx-js-webidl.wasm"
+    />
     <style>
       :root {
         color-scheme: dark;
@@ -60,7 +70,7 @@
     </style>
   </head>
   <body>
-    <p class="label">M-ABD | JOINT-NET DEMOS</p>
+    <p class="label">M-ABD | PHYSX DEMOS</p>
     <canvas id="bevy-canvas" tabindex="0"></canvas>
   </body>
 </html>
