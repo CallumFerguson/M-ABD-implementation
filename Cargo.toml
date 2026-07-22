@@ -1,0 +1,22 @@
+[package]
+name = "m-abd-joint-net"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal M-ABD 10x10 ball-joint net demo for native and web targets"
+
+[dependencies]
+bevy = "0.19"
+
+# Keep development builds responsive while still compiling this crate quickly.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Keep distributable native and browser builds compact.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
