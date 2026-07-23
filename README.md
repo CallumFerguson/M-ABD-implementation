@@ -1,15 +1,17 @@
-# M-ABD and PhysX demos
+# M-ABD and PhysX comparison
 
 A focused proof-of-concept implementation of the ball-joint nets from
 *M-ABD: Scalable, Efficient, and Robust Multi-Affine-Body Dynamics*.
 
-The application has four scenes that can be changed at runtime. Changing or
-resetting a scene rebuilds that scene's simulation:
+The application has three scenes that can be changed at runtime. Each scene can
+run either the project's M-ABD-inspired solver or an independently constructed
+PhysX version. Changing the scene, changing the backend, or resetting rebuilds
+the selected simulation from its initial state:
 
 - `1`: the original edge-pinned 10x10 joint grid
 - `2`: the edge-pinned joint grid draped over a static cylinder
 - `3`: a horizontal, four-corner-pinned joint grid catching three falling balls
-- `4`: a PhysX smoke test with one dynamic cube falling onto one fixed cube
+- `B`: switch between the project solver and PhysX
 - `R`: reset the current scene
 - `30`, `60`, `120`, `200`, and `500` Hz buttons: change the fixed simulation
   rate without resetting the scene
@@ -30,11 +32,14 @@ the cylinder and falling balls. The default timestep is the Figure 12 value of
 compact overlay reports the active scene, smoothed FPS and frame time, measured
 simulation-step duration, fixed rate, and scene size.
 
-Scene 4 is deliberately independent of the M-ABD implementation. Bevy owns the
-window, rendering, input, scene switching, and overlay, while PhysX owns the two
-rigid bodies and supplies the falling cube's pose. Native builds use the
-`physx` Rust wrapper (PhysX 5.1.3); browser builds use the official
-`physx-js-webidl` WebAssembly package (PhysX 5.6.1).
+The PhysX versions manually recreate all three setups with rigid sphere and box
+actors connected by spherical joints, plus a static capsule for the cylinder
+scene and rigid spheres for the falling-ball scene. There is no live state
+transfer or shared physics-scene format between the backends. Bevy owns the
+window, rendering, input, scene switching, and overlay; the active backend owns
+the simulation state. Native builds use the `physx` Rust wrapper (PhysX 5.1.3),
+while browser builds use the `physx-js-webidl` WebAssembly package (PhysX
+5.6.1).
 
 ## Run natively
 
@@ -75,6 +80,7 @@ This demo includes co-rotated affine bodies, fixed-step implicit prediction,
 linear ball joints, a dual constraint solve, and deliberately narrow analytic
 contacts for spheres, rod capsules, and one static cylinder. It intentionally
 omits friction, restitution, continuous collision detection, self-collision,
-arbitrary mesh collision, other joint types, controls, GPU compute, and the
-paper's million-body solver optimizations. The PhysX scene is only a two-body
-integration check; it does not yet recreate any of the paper scenes in PhysX.
+arbitrary mesh collision, other joint types, interactive manipulation, GPU
+compute, and the paper's million-body solver optimizations. The PhysX versions
+are deliberately narrow equivalents of these three demos, not a general
+scene-conversion layer.

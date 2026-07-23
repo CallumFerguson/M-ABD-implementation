@@ -2,7 +2,7 @@
 name = "m-abd-joint-net"
 version = "0.1.0"
 edition = "2024"
-description = "A minimal M-ABD 10x10 ball-joint net demo for native and web targets"
+description = "A minimal M-ABD and PhysX 10x10 ball-joint net comparison for native and web"
 
 [dependencies]
 bevy = "0.19"
@@ -12,6 +12,7 @@ physx = "0.19"
 physx-sys = "0.11.5"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
 wasm-bindgen = "0.2"
 
 # Keep development builds responsive while still compiling this crate quickly.

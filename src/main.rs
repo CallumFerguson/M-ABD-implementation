@@ -21,7 +21,7 @@ const DUAL_TOLERANCE: f64 = 1.0e-7;
 const MAX_PCG_ITERATIONS: usize = 100;
 const COROTATED_ITERATIONS: usize = 24;
 const CONTACT_PASSES: usize = 2;
-const DEMO_COUNT: usize = 4;
+const DEMO_COUNT: usize = 3;
 
 const HUB_RADIUS: f32 = 0.075;
 const ROD_THICKNESS: f32 = 0.055;
@@ -36,11 +36,10 @@ const ROD_START: [f64; 4] = [0.5, 0.5, 0.0, 0.0];
 const ROD_END: [f64; 4] = [0.0, 0.0, 0.5, 0.5];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DemoScene {
+pub(crate) enum DemoScene {
     JointGrid,
     CylinderDrape,
     FallingBalls,
-    PhysxDrop,
 }
 
 impl DemoScene {
@@ -49,7 +48,6 @@ impl DemoScene {
             Self::JointGrid => 1,
             Self::CylinderDrape => 2,
             Self::FallingBalls => 3,
-            Self::PhysxDrop => 4,
         }
     }
 
@@ -58,17 +56,30 @@ impl DemoScene {
             Self::JointGrid => "Joint grid",
             Self::CylinderDrape => "Cylinder drape",
             Self::FallingBalls => "Falling balls",
-            Self::PhysxDrop => "PhysX cube drop",
         }
     }
+}
 
-    fn is_mabd(self) -> bool {
-        self != Self::PhysxDrop
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimulationBackend {
+    Project,
+    Physx,
+}
+
+impl SimulationBackend {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Project => Self::Physx,
+            Self::Physx => Self::Project,
+        }
     }
 }
 
 #[derive(Resource)]
-struct ActiveDemo(DemoScene);
+struct ActiveDemo {
+    scene: DemoScene,
+    backend: SimulationBackend,
+}
 
 #[derive(Clone, Copy)]
 enum BodyKind {
@@ -222,7 +233,6 @@ struct SimulationTiming {
 
 impl NetSimulation {
     fn new(scene: DemoScene) -> Self {
-        assert!(scene.is_mabd(), "PhysX does not use NetSimulation");
         let mut bodies = Vec::with_capacity(3 * GRID_SIZE * GRID_SIZE - 2 * GRID_SIZE + 3);
         let mut joints = Vec::with_capacity(4 * GRID_SIZE * (GRID_SIZE - 1));
         let mut hubs = [[0usize; GRID_SIZE]; GRID_SIZE];
@@ -249,7 +259,6 @@ impl NetSimulation {
                         (row == 0 || row == GRID_SIZE - 1)
                             && (column == 0 || column == GRID_SIZE - 1)
                     }
-                    DemoScene::PhysxDrop => unreachable!(),
                 };
                 let body_index = bodies.len();
 
@@ -363,7 +372,6 @@ impl NetSimulation {
                     DemoScene::FallingBalls => {
                         project_ball_contacts(&mut self.bodies, &self.ball_indices);
                     }
-                    DemoScene::PhysxDrop => unreachable!(),
                 }
             }
         }
@@ -376,9 +384,6 @@ impl NetSimulation {
 
 #[derive(Component)]
 struct BodyVisual(usize);
-
-#[derive(Component)]
-struct PhysxCubeVisual;
 
 #[derive(Component)]
 struct SceneVisual;
@@ -398,8 +403,6 @@ struct VisualAssets {
     rod_mesh: Handle<Mesh>,
     ball_mesh: Handle<Mesh>,
     cylinder_mesh: Handle<Mesh>,
-    physx_cube_mesh: Handle<Mesh>,
-    physx_ground_mesh: Handle<Mesh>,
     hub_material: Handle<StandardMaterial>,
     rod_material: Handle<StandardMaterial>,
     fixed_material: Handle<StandardMaterial>,
@@ -412,12 +415,15 @@ fn main() {
     app.insert_non_send(PhysxDemo::new())
         .insert_resource(ClearColor(Color::srgb(0.012, 0.018, 0.03)))
         .insert_resource(Time::<Fixed>::from_hz(DEFAULT_FIXED_HZ))
-        .insert_resource(ActiveDemo(DemoScene::JointGrid))
+        .insert_resource(ActiveDemo {
+            scene: DemoScene::JointGrid,
+            backend: SimulationBackend::Project,
+        })
         .insert_resource(NetSimulation::new(DemoScene::JointGrid))
         .init_resource::<SimulationTiming>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "M-ABD Joint Net Demos".into(),
+                title: "M-ABD Physics Comparison".into(),
                 resolution: WindowResolution::new(1100, 700),
                 present_mode: PresentMode::AutoVsync,
                 canvas: Some("#bevy-canvas".into()),
@@ -437,8 +443,9 @@ fn main() {
                 change_fixed_hz,
                 style_fixed_hz_buttons,
                 ApplyDeferred,
+                refresh_physx_transforms,
                 sync_body_visuals,
-                sync_physx_visual,
+                sync_physx_visuals,
                 update_performance_overlay,
             )
                 .chain(),
@@ -461,8 +468,6 @@ fn setup_scene(
         )),
         ball_mesh: meshes.add(Sphere::new(BALL_RADIUS)),
         cylinder_mesh: meshes.add(Cylinder::new(CYLINDER_RADIUS, CYLINDER_LENGTH)),
-        physx_cube_mesh: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
-        physx_ground_mesh: meshes.add(Cuboid::new(6.0, 1.0, 6.0)),
         hub_material: materials.add(StandardMaterial {
             base_color: Color::srgb(0.56, 0.65, 0.76),
             metallic: 0.55,
@@ -516,7 +521,7 @@ fn setup_scene(
 
     commands.spawn((
         Text::new(format!(
-            "SCENE 1/{DEMO_COUNT}  Joint grid\nFPS       --\nFRAME     -- ms\nSIM STEP  -- ms\nFIXED    {DEFAULT_FIXED_HZ:>5.0} Hz\n280 bodies | 360 joints\n[1] Grid  [2] Cylinder  [3] Balls  [4] PhysX  [R] Reset"
+            "SCENE 1/{DEMO_COUNT}  Joint grid\nBACKEND  PROJECT\nFPS       --\nFRAME     -- ms\nSIM STEP  -- ms\nFIXED    {DEFAULT_FIXED_HZ:>5.0} Hz\n280 bodies | 360 joints\n[1] Grid  [2] Cylinder  [3] Balls  [B] Backend  [R] Reset"
         )),
         TextFont {
             font_size: FontSize::Px(15.0),
@@ -621,22 +626,6 @@ fn spawn_scene_visuals(commands: &mut Commands, simulation: &NetSimulation, asse
     }
 }
 
-fn spawn_physx_visuals(commands: &mut Commands, physx: &PhysxDemo, assets: &VisualAssets) {
-    commands.spawn((
-        Mesh3d(assets.physx_ground_mesh.clone()),
-        MeshMaterial3d(assets.fixed_material.clone()),
-        Transform::from_xyz(0.0, -0.5, 0.0),
-        SceneVisual,
-    ));
-    commands.spawn((
-        Mesh3d(assets.physx_cube_mesh.clone()),
-        MeshMaterial3d(assets.ball_material.clone()),
-        physx.cube_transform(),
-        PhysxCubeVisual,
-        SceneVisual,
-    ));
-}
-
 fn switch_demo_scene(
     keys: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
@@ -648,16 +637,16 @@ fn switch_demo_scene(
     scene_visuals: Query<Entity, With<SceneVisual>>,
     mut camera: Query<&mut Transform, With<MainCamera>>,
 ) {
-    let target = if keys.just_pressed(KeyCode::Digit1) {
-        DemoScene::JointGrid
+    let (target_scene, target_backend) = if keys.just_pressed(KeyCode::Digit1) {
+        (DemoScene::JointGrid, active.backend)
     } else if keys.just_pressed(KeyCode::Digit2) {
-        DemoScene::CylinderDrape
+        (DemoScene::CylinderDrape, active.backend)
     } else if keys.just_pressed(KeyCode::Digit3) {
-        DemoScene::FallingBalls
-    } else if keys.just_pressed(KeyCode::Digit4) {
-        DemoScene::PhysxDrop
+        (DemoScene::FallingBalls, active.backend)
+    } else if keys.just_pressed(KeyCode::KeyB) {
+        (active.scene, active.backend.toggled())
     } else if keys.just_pressed(KeyCode::KeyR) {
-        active.0
+        (active.scene, active.backend)
     } else {
         return;
     };
@@ -666,19 +655,18 @@ fn switch_demo_scene(
         commands.entity(entity).despawn();
     }
 
-    if target.is_mabd() {
-        let next_simulation = NetSimulation::new(target);
-        spawn_scene_visuals(&mut commands, &next_simulation, &assets);
-        *simulation = next_simulation;
-    } else {
-        physx.reset();
-        spawn_physx_visuals(&mut commands, &physx, &assets);
+    let next_simulation = NetSimulation::new(target_scene);
+    if target_backend == SimulationBackend::Physx {
+        physx.reset(target_scene);
     }
-    active.0 = target;
+    spawn_scene_visuals(&mut commands, &next_simulation, &assets);
+    *simulation = next_simulation;
+    active.scene = target_scene;
+    active.backend = target_backend;
     *timing = SimulationTiming::default();
 
     if let Ok(mut transform) = camera.single_mut() {
-        *transform = camera_transform(target);
+        *transform = camera_transform(target_scene);
     }
 }
 
@@ -721,9 +709,6 @@ fn camera_transform(scene: DemoScene) -> Transform {
         DemoScene::FallingBalls => {
             Transform::from_xyz(7.4, 5.7, 8.8).looking_at(Vec3::new(0.0, 1.8, 0.0), Vec3::Y)
         }
-        DemoScene::PhysxDrop => {
-            Transform::from_xyz(6.0, 4.2, 7.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y)
-        }
     }
 }
 
@@ -733,7 +718,7 @@ fn step_simulation(
     mut simulation: ResMut<NetSimulation>,
     mut timing: ResMut<SimulationTiming>,
 ) {
-    if !active.0.is_mabd() {
+    if active.backend != SimulationBackend::Project {
         return;
     }
 
@@ -748,7 +733,7 @@ fn step_physx_simulation(
     mut physx: NonSendMut<PhysxDemo>,
     mut timing: ResMut<SimulationTiming>,
 ) {
-    if active.0 != DemoScene::PhysxDrop {
+    if active.backend != SimulationBackend::Physx {
         return;
     }
 
@@ -758,9 +743,14 @@ fn step_physx_simulation(
 }
 
 fn sync_body_visuals(
+    active: Res<ActiveDemo>,
     simulation: Res<NetSimulation>,
     mut visuals: Query<(&BodyVisual, &mut Transform)>,
 ) {
+    if active.backend != SimulationBackend::Project {
+        return;
+    }
+
     for (visual, mut transform) in &mut visuals {
         if let Some(body) = simulation.bodies.get(visual.0) {
             *transform = body_transform(body);
@@ -768,12 +758,25 @@ fn sync_body_visuals(
     }
 }
 
-fn sync_physx_visual(
+fn refresh_physx_transforms(active: Res<ActiveDemo>, mut physx: NonSendMut<PhysxDemo>) {
+    if active.backend == SimulationBackend::Physx {
+        physx.refresh_body_transforms();
+    }
+}
+
+fn sync_physx_visuals(
+    active: Res<ActiveDemo>,
     physx: NonSend<PhysxDemo>,
-    mut visuals: Query<&mut Transform, With<PhysxCubeVisual>>,
+    mut visuals: Query<(&BodyVisual, &mut Transform)>,
 ) {
-    for mut transform in &mut visuals {
-        *transform = physx.cube_transform();
+    if active.backend != SimulationBackend::Physx {
+        return;
+    }
+
+    for (visual, mut transform) in &mut visuals {
+        if let Some(body_transform) = physx.body_transforms().get(visual.0) {
+            *transform = *body_transform;
+        }
     }
 }
 
@@ -797,26 +800,20 @@ fn update_performance_overlay(
         .map(|value| format!("{value:>5.2}"))
         .unwrap_or_else(|| "   --".into());
     let fixed_hz = 1.0 / fixed_time.timestep().as_secs_f64();
-    let (body_count, joint_count, backend_status) = if active.0 == DemoScene::PhysxDrop {
-        (2, 0, format!("\nPHYSX   {}", physx.status()))
-    } else {
-        (
-            simulation.bodies.len(),
-            simulation.joints.len(),
-            String::new(),
-        )
+    let backend = match active.backend {
+        SimulationBackend::Project => "PROJECT".to_owned(),
+        SimulationBackend::Physx => format!("PHYSX {}", physx.status()),
     };
 
     for mut text in &mut overlays {
         text.0 = format!(
-            "SCENE {}/{}  {}\nFPS      {fps}\nFRAME    {frame_time} ms\nSIM STEP {:>5.2} ms\nFIXED    {fixed_hz:>5.0} Hz\n{} bodies | {} joints{}\n[1] Grid  [2] Cylinder  [3] Balls  [4] PhysX  [R] Reset",
-            active.0.number(),
+            "SCENE {}/{}  {}\nBACKEND  {backend}\nFPS      {fps}\nFRAME    {frame_time} ms\nSIM STEP {:>5.2} ms\nFIXED    {fixed_hz:>5.0} Hz\n{} bodies | {} joints\n[1] Grid  [2] Cylinder  [3] Balls  [B] Backend  [R] Reset",
+            active.scene.number(),
             DEMO_COUNT,
-            active.0.title(),
+            active.scene.title(),
             timing.latest_step_ms,
-            body_count,
-            joint_count,
-            backend_status,
+            simulation.bodies.len(),
+            simulation.joints.len(),
         );
     }
 }
