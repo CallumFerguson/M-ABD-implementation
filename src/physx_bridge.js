@@ -1,12 +1,12 @@
-const GRID_SIZE = 10;
 const GRID_SPACING = 0.55;
+const SUPPORTED_GRID_SIZES = new Set([10, 25, 50, 100]);
 const ROD_LENGTH_FACTOR = 0.78;
 const HUB_RADIUS = 0.075;
 const ROD_RADIUS = 0.055 * 0.5;
 const BALL_RADIUS = 0.34;
 const CYLINDER_RADIUS = 0.70;
-const CYLINDER_LENGTH = 5.80;
-const NET_BODY_COUNT = 280;
+const CYLINDER_LENGTH_PADDING = 0.85;
+const CYLINDER_CENTER_OFFSET = 0.175;
 const HUB_MASS = 0.18;
 const ROD_MASS = 0.24;
 const BALL_MASS = 1.2;
@@ -31,7 +31,7 @@ let world = null;
 let transforms = EMPTY_TRANSFORMS;
 let statusCode = 0;
 let loadPromise = null;
-let pendingScene = null;
+let pendingConfig = null;
 
 export function physx_begin_load() {
   if (loadPromise) {
@@ -59,26 +59,35 @@ export function physx_begin_load() {
       }
 
       statusCode = 1;
-      if (pendingScene !== null) {
-        const scene = pendingScene;
-        pendingScene = null;
-        createWorld(scene);
+      if (pendingConfig !== null) {
+        const config = pendingConfig;
+        pendingConfig = null;
+        createWorld(config.scene, config.gridSize);
       }
     })
     .catch((error) => fail("Unable to initialize PhysX", error));
 }
 
-export function physx_reset(sceneId) {
+export function physx_reset(sceneId, gridSize) {
   const normalizedScene = normalizeScene(sceneId);
+  const normalizedGridSize = normalizeGridSize(gridSize);
   if (statusCode === 1) {
     try {
-      createWorld(normalizedScene);
+      createWorld(normalizedScene, normalizedGridSize);
     } catch (error) {
       fail("Unable to create PhysX scene", error);
     }
   } else if (statusCode === 0) {
-    pendingScene = normalizedScene;
+    pendingConfig = {
+      scene: normalizedScene,
+      gridSize: normalizedGridSize,
+    };
   }
+}
+
+export function physx_clear() {
+  pendingConfig = null;
+  releaseWorld();
 }
 
 // This function intentionally performs only simulation work. Transform
@@ -145,8 +154,26 @@ function normalizeScene(sceneId) {
   return scene;
 }
 
-function createWorld(sceneId) {
+function normalizeGridSize(gridSize) {
+  const size = Math.trunc(Number(gridSize));
+  if (!SUPPORTED_GRID_SIZES.has(size)) {
+    throw new RangeError(`Unsupported PhysX grid size: ${gridSize}`);
+  }
+  return size;
+}
+
+function netBodyCount(gridSize) {
+  return 3 * gridSize * gridSize - 2 * gridSize;
+}
+
+function netJointCount(gridSize) {
+  return 4 * gridSize * (gridSize - 1);
+}
+
+function createWorld(sceneId, gridSize) {
   releaseWorld();
+
+  const bodyCount = netBodyCount(gridSize);
 
   const next = {
     scene: null,
@@ -178,8 +205,8 @@ function createWorld(sceneId) {
 
     next.material = physics.createMaterial(0.25, 0.20, 0.03);
     next.aggregate = physics.createAggregate(
-      NET_BODY_COUNT,
-      NET_BODY_COUNT,
+      bodyCount,
+      bodyCount,
       false,
     );
     shapeFlags = new PhysX.PxShapeFlags(
@@ -192,13 +219,13 @@ function createWorld(sceneId) {
     filterData = new PhysX.PxFilterData(1, 1, 0, 0);
     next.filterData = filterData;
 
-    buildJointNet(next, shapeFlags, sceneId);
+    buildJointNet(next, shapeFlags, sceneId, gridSize);
     if (!next.scene.addAggregate(next.aggregate)) {
       throw new Error("Unable to add joint-net aggregate to the scene");
     }
 
     if (sceneId === SCENE_CYLINDER) {
-      buildCylinder(next, shapeFlags);
+      buildCylinder(next, shapeFlags, gridSize);
     } else if (sceneId === SCENE_BALLS) {
       buildBalls(next, shapeFlags);
     }
@@ -221,12 +248,12 @@ function createWorld(sceneId) {
   }
 }
 
-function buildJointNet(next, shapeFlags, sceneId) {
-  const hubs = Array.from({ length: GRID_SIZE }, () =>
-    new Array(GRID_SIZE),
+function buildJointNet(next, shapeFlags, sceneId, gridSize) {
+  const hubs = Array.from({ length: gridSize }, () =>
+    new Array(gridSize),
   );
-  const positions = Array.from({ length: GRID_SIZE }, () =>
-    new Array(GRID_SIZE),
+  const positions = Array.from({ length: gridSize }, () =>
+    new Array(gridSize),
   );
   const gridHeight = sceneId === SCENE_BALLS ? 1.70 : 3.0;
   const hubGeometry = new PhysX.PxSphereGeometry(HUB_RADIUS);
@@ -237,20 +264,20 @@ function buildJointNet(next, shapeFlags, sceneId) {
   );
 
   try {
-    // Hubs occupy indices 0..99, matching NetSimulation.
-    for (let row = 0; row < GRID_SIZE; row += 1) {
-      for (let column = 0; column < GRID_SIZE; column += 1) {
+    // Hubs are first, matching NetSimulation's body ordering.
+    for (let row = 0; row < gridSize; row += 1) {
+      for (let column = 0; column < gridSize; column += 1) {
         const position = [
-          (column - (GRID_SIZE - 1) * 0.5) * GRID_SPACING,
+          (column - (gridSize - 1) * 0.5) * GRID_SPACING,
           gridHeight,
           sceneId === SCENE_BALLS
-            ? (row - (GRID_SIZE - 1) * 0.5) * GRID_SPACING
+            ? (row - (gridSize - 1) * 0.5) * GRID_SPACING
             : -row * GRID_SPACING,
         ];
         const fixed =
           sceneId === SCENE_BALLS
-            ? (row === 0 || row === GRID_SIZE - 1) &&
-              (column === 0 || column === GRID_SIZE - 1)
+            ? (row === 0 || row === gridSize - 1) &&
+              (column === 0 || column === gridSize - 1)
             : row === 0;
         const hub = createActor(
           next,
@@ -269,9 +296,9 @@ function buildJointNet(next, shapeFlags, sceneId) {
       }
     }
 
-    // Horizontal rods occupy indices 100..189.
-    for (let row = 0; row < GRID_SIZE; row += 1) {
-      for (let column = 0; column < GRID_SIZE - 1; column += 1) {
+    // Horizontal rods follow the hubs.
+    for (let row = 0; row < gridSize; row += 1) {
+      for (let column = 0; column < gridSize - 1; column += 1) {
         addRod(
           next,
           shapeFlags,
@@ -285,11 +312,11 @@ function buildJointNet(next, shapeFlags, sceneId) {
       }
     }
 
-    // Vertical rods occupy indices 190..279.
+    // Vertical rods follow the horizontal rods.
     const verticalRotation =
       sceneId === SCENE_BALLS ? X_TO_POSITIVE_Z : X_TO_NEGATIVE_Z;
-    for (let row = 0; row < GRID_SIZE - 1; row += 1) {
-      for (let column = 0; column < GRID_SIZE; column += 1) {
+    for (let row = 0; row < gridSize - 1; row += 1) {
+      for (let column = 0; column < gridSize; column += 1) {
         addRod(
           next,
           shapeFlags,
@@ -307,7 +334,10 @@ function buildJointNet(next, shapeFlags, sceneId) {
     PhysX.destroy(hubGeometry);
   }
 
-  if (next.renderActors.length !== NET_BODY_COUNT || next.joints.length !== 360) {
+  if (
+    next.renderActors.length !== netBodyCount(gridSize) ||
+    next.joints.length !== netJointCount(gridSize)
+  ) {
     throw new Error("Joint-net construction produced unexpected counts");
   }
 }
@@ -362,19 +392,22 @@ function createSphericalJoint(next, rod, hub, rodOffset) {
   next.joints.push(joint);
 }
 
-function buildCylinder(next, shapeFlags) {
+function buildCylinder(next, shapeFlags, gridSize) {
+  const gridSpan = (gridSize - 1) * GRID_SPACING;
+  const cylinderLength = gridSpan + CYLINDER_LENGTH_PADDING;
+  const cylinderZ = -gridSpan * 0.5 + CYLINDER_CENTER_OFFSET;
   // PxCapsuleGeometry is X-aligned; subtracting the radius makes its total
-  // end-to-end length match the 5.8-unit cylinder visual.
+  // end-to-end length match the grid-width cylinder visual.
   const geometry = new PhysX.PxCapsuleGeometry(
     CYLINDER_RADIUS,
-    CYLINDER_LENGTH * 0.5 - CYLINDER_RADIUS,
+    cylinderLength * 0.5 - CYLINDER_RADIUS,
   );
   try {
     const cylinder = createActor(
       next,
       shapeFlags,
       geometry,
-      [0, 1.75, -2.30],
+      [0, 1.75, cylinderZ],
       IDENTITY_ROTATION,
       0,
       true,
@@ -397,7 +430,7 @@ function buildBalls(next, shapeFlags) {
   ];
 
   try {
-    // Balls occupy indices 280..282, matching NetSimulation.
+    // Balls follow all net bodies, matching NetSimulation.
     for (const position of ballPositions) {
       const ball = createActor(
         next,

@@ -13,15 +13,22 @@ the selected simulation from its initial state:
 - `3`: a horizontal, four-corner-pinned joint grid catching three falling balls
 - `B`: switch between the project solver and PhysX
 - `R`: reset the current scene
+- `10x10`, `25x25`, `50x50`, and `100x100` buttons: rebuild the current
+  scene/backend with that grid size
 - `30`, `60`, `120`, `200`, and `500` Hz buttons: change the fixed simulation
   rate without resetting the scene
 
-Each net contains the paper's inferred 280-body topology:
+The default 10x10 net contains the paper's inferred 280-body topology:
 
 - 100 affine hub bodies arranged in a 10x10 grid
 - 180 affine rod bodies joining horizontal and vertical neighbors
 - 360 ball joints, or 1,080 scalar positional constraints
-- either 10 fixed hubs along one edge or four fixed corner hubs
+- either one fixed edge (10 hubs at the default size) or four fixed corner hubs
+
+For an `N x N` grid, the same topology scales to `3N² - 2N` bodies and
+`4N(N - 1)` ball joints. Grid-size changes preserve the existing per-cell
+spacing, resize the cylinder scene to span the wider net, reframe the camera,
+and reset the simulation.
 
 Each affine body is represented by the four control points from Section 4.1.
 Each fixed step performs an implicit prediction and a compact co-rotated
@@ -30,7 +37,7 @@ constraints. Primitive sphere/capsule contacts provide two-way interaction with
 the cylinder and falling balls. The default timestep is the Figure 12 value of
 `1/30 s`; the on-screen controls can change it up to `1/500 s` at runtime. A
 compact overlay reports the active scene, smoothed FPS and frame time, measured
-simulation-step duration, fixed rate, and scene size.
+simulation-step duration, fixed rate, grid dimensions, and scene size.
 
 The PhysX versions manually recreate all three setups with rigid sphere and box
 actors connected by spherical joints, plus a static capsule for the cylinder

@@ -11,14 +11,14 @@ mod platform {
     use physx::traits::Class;
     use std::ptr::NonNull;
 
-    const GRID_SIZE: usize = 10;
     const GRID_SPACING: f32 = 0.55;
     const HUB_RADIUS: f32 = 0.075;
     const ROD_THICKNESS: f32 = 0.055;
     const ROD_LENGTH_FACTOR: f32 = 0.78;
     const BALL_RADIUS: f32 = 0.34;
     const CYLINDER_RADIUS: f32 = 0.70;
-    const CYLINDER_LENGTH: f32 = 5.80;
+    const CYLINDER_LENGTH_PADDING: f32 = 0.85;
+    const CYLINDER_CENTER_OFFSET: f32 = 0.175;
 
     const HUB_MASS: f32 = 0.18;
     const ROD_MASS: f32 = 0.24;
@@ -137,10 +137,15 @@ mod platform {
             }
         }
 
-        pub fn reset(&mut self, scene: DemoScene) {
+        pub fn reset(&mut self, scene: DemoScene, grid_size: usize) {
+            assert!(grid_size >= 2, "PhysX grid size must be at least 2");
             self.world = None;
-            self.world = Some(Self::create_world(&mut self.physics, scene));
+            self.world = Some(Self::create_world(&mut self.physics, scene, grid_size));
             self.refresh_body_transforms();
+        }
+
+        pub fn clear(&mut self) {
+            self.world = None;
         }
 
         fn create_world(
@@ -149,6 +154,7 @@ mod platform {
                 PxShape,
             >,
             demo_scene: DemoScene,
+            grid_size: usize,
         ) -> PhysxWorld {
             let mut scene: Owner<PxScene> = physics
                 .create(SceneDescriptor {
@@ -164,15 +170,15 @@ mod platform {
                 .create_material(0.25, 0.20, 0.03, ())
                 .expect("PhysX should create the demo material");
 
-            let mut body_actors = Vec::with_capacity(if demo_scene == DemoScene::FallingBalls {
-                283
-            } else {
-                280
-            });
+            let expected_net_bodies = net_body_count(grid_size);
+            let expected_bodies =
+                expected_net_bodies + usize::from(demo_scene == DemoScene::FallingBalls) * 3;
+            let expected_connections = rod_count(grid_size);
+            let mut body_actors = Vec::with_capacity(expected_bodies);
             let mut initial_transforms = Vec::with_capacity(body_actors.capacity());
-            let mut hub_indices = [[0usize; GRID_SIZE]; GRID_SIZE];
-            let mut hub_positions = [[Vec3::ZERO; GRID_SIZE]; GRID_SIZE];
-            let mut connections = Vec::with_capacity(180);
+            let mut hub_indices = vec![0usize; grid_size * grid_size];
+            let mut hub_positions = vec![Vec3::ZERO; grid_size * grid_size];
+            let mut connections = Vec::with_capacity(expected_connections);
             let grid_height = if demo_scene == DemoScene::FallingBalls {
                 1.70
             } else {
@@ -182,13 +188,13 @@ mod platform {
             let hub_geometry = PxSphereGeometry::new(HUB_RADIUS);
             let hub_density = HUB_MASS / sphere_volume(HUB_RADIUS);
 
-            for row in 0..GRID_SIZE {
-                for column in 0..GRID_SIZE {
+            for row in 0..grid_size {
+                for column in 0..grid_size {
                     let position = Vec3::new(
-                        (column as f32 - (GRID_SIZE - 1) as f32 * 0.5) * GRID_SPACING,
+                        (column as f32 - (grid_size - 1) as f32 * 0.5) * GRID_SPACING,
                         grid_height,
                         if demo_scene == DemoScene::FallingBalls {
-                            (row as f32 - (GRID_SIZE - 1) as f32 * 0.5) * GRID_SPACING
+                            (row as f32 - (grid_size - 1) as f32 * 0.5) * GRID_SPACING
                         } else {
                             -(row as f32) * GRID_SPACING
                         },
@@ -196,8 +202,8 @@ mod platform {
                     let fixed = match demo_scene {
                         DemoScene::JointGrid | DemoScene::CylinderDrape => row == 0,
                         DemoScene::FallingBalls => {
-                            (row == 0 || row == GRID_SIZE - 1)
-                                && (column == 0 || column == GRID_SIZE - 1)
+                            (row == 0 || row == grid_size - 1)
+                                && (column == 0 || column == grid_size - 1)
                         }
                     };
                     let body_index = body_actors.len();
@@ -234,8 +240,9 @@ mod platform {
                         ptr
                     };
 
-                    hub_indices[row][column] = body_index;
-                    hub_positions[row][column] = position;
+                    let hub_slot = row * grid_size + column;
+                    hub_indices[hub_slot] = body_index;
+                    hub_positions[hub_slot] = position;
                     body_actors.push(actor_ptr);
                     initial_transforms
                         .push(Transform::from_translation(position).with_rotation(Quat::IDENTITY));
@@ -250,18 +257,20 @@ mod platform {
             let rod_density =
                 ROD_MASS / (GRID_SPACING * ROD_LENGTH_FACTOR * ROD_THICKNESS * ROD_THICKNESS);
 
-            for row in 0..GRID_SIZE {
-                for column in 0..(GRID_SIZE - 1) {
+            for row in 0..grid_size {
+                for column in 0..(grid_size - 1) {
+                    let start_slot = row * grid_size + column;
+                    let end_slot = start_slot + 1;
                     add_rod(
                         physics,
                         &mut scene,
                         &mut material,
                         &rod_geometry,
                         rod_density,
-                        hub_indices[row][column],
-                        hub_indices[row][column + 1],
-                        hub_positions[row][column],
-                        hub_positions[row][column + 1],
+                        hub_indices[start_slot],
+                        hub_indices[end_slot],
+                        hub_positions[start_slot],
+                        hub_positions[end_slot],
                         &mut body_actors,
                         &mut initial_transforms,
                         &mut connections,
@@ -269,18 +278,20 @@ mod platform {
                 }
             }
 
-            for row in 0..(GRID_SIZE - 1) {
-                for column in 0..GRID_SIZE {
+            for row in 0..(grid_size - 1) {
+                for column in 0..grid_size {
+                    let start_slot = row * grid_size + column;
+                    let end_slot = start_slot + grid_size;
                     add_rod(
                         physics,
                         &mut scene,
                         &mut material,
                         &rod_geometry,
                         rod_density,
-                        hub_indices[row][column],
-                        hub_indices[row + 1][column],
-                        hub_positions[row][column],
-                        hub_positions[row + 1][column],
+                        hub_indices[start_slot],
+                        hub_indices[end_slot],
+                        hub_positions[start_slot],
+                        hub_positions[end_slot],
                         &mut body_actors,
                         &mut initial_transforms,
                         &mut connections,
@@ -288,19 +299,22 @@ mod platform {
                 }
             }
 
-            debug_assert_eq!(body_actors.len(), 280);
-            debug_assert_eq!(connections.len(), 180);
+            debug_assert_eq!(body_actors.len(), expected_net_bodies);
+            debug_assert_eq!(connections.len(), expected_connections);
 
             if demo_scene == DemoScene::CylinderDrape {
                 // PhysX capsules are X-axis aligned, matching this scene's cylinder.
                 // PxCapsuleGeometry's length is 2 * (half-height + radius).
+                let grid_span = (grid_size - 1) as f32 * GRID_SPACING;
+                let cylinder_length = grid_span + CYLINDER_LENGTH_PADDING;
+                let cylinder_z = -grid_span * 0.5 + CYLINDER_CENTER_OFFSET;
                 let cylinder_geometry = PxCapsuleGeometry::new(
                     CYLINDER_RADIUS,
-                    CYLINDER_LENGTH * 0.5 - CYLINDER_RADIUS,
+                    cylinder_length * 0.5 - CYLINDER_RADIUS,
                 );
                 let mut cylinder = physics
                     .create_rigid_static(
-                        PxTransform::from_translation(&PxVec3::new(0.0, 1.75, -2.30)),
+                        PxTransform::from_translation(&PxVec3::new(0.0, 1.75, cylinder_z)),
                         &cylinder_geometry,
                         material.as_mut(),
                         PxTransform::default(),
@@ -341,7 +355,8 @@ mod platform {
             }
 
             let physics_ptr: *mut physx_sys::PxPhysics = physics.as_mut_ptr();
-            let mut joints = Vec::with_capacity(360);
+            let expected_joints = joint_count(grid_size);
+            let mut joints = Vec::with_capacity(expected_joints);
             let hub_frame = PxTransform::default();
             let start_frame =
                 PxTransform::from_translation(&PxVec3::new(-GRID_SPACING * 0.5, 0.0, 0.0));
@@ -365,7 +380,8 @@ mod platform {
                 ));
             }
 
-            debug_assert_eq!(joints.len(), 360);
+            debug_assert_eq!(joints.len(), expected_joints);
+            debug_assert_eq!(body_actors.len(), expected_bodies);
 
             PhysxWorld {
                 _joints: joints,
@@ -502,6 +518,18 @@ mod platform {
         4.0 / 3.0 * std::f32::consts::PI * radius.powi(3)
     }
 
+    fn rod_count(grid_size: usize) -> usize {
+        2 * grid_size * (grid_size - 1)
+    }
+
+    fn net_body_count(grid_size: usize) -> usize {
+        grid_size * grid_size + rod_count(grid_size)
+    }
+
+    fn joint_count(grid_size: usize) -> usize {
+        2 * rod_count(grid_size)
+    }
+
     unsafe extern "C" fn simulation_filter(
         callback: *mut physx_sys::FilterShaderCallbackInfo,
     ) -> physx_sys::PxFilterFlags {
@@ -529,7 +557,7 @@ mod platform {
                 (DemoScene::CylinderDrape, 280),
                 (DemoScene::FallingBalls, 283),
             ] {
-                demo.reset(scene);
+                demo.reset(scene, 10);
                 assert_eq!(demo.body_transforms().len(), expected_bodies);
                 assert!(
                     demo.body_transforms()
@@ -546,6 +574,29 @@ mod platform {
                         .all(|pose| pose.translation.is_finite())
                 );
             }
+
+            // Exercise the dynamic allocation/indexing path without stepping a
+            // large world in the test suite.
+            demo.reset(DemoScene::JointGrid, 25);
+            assert_eq!(demo.body_transforms().len(), 1_825);
+            assert!(
+                demo.body_transforms()
+                    .iter()
+                    .all(|pose| pose.translation.is_finite())
+            );
+        }
+
+        #[test]
+        fn body_and_joint_counts_scale_with_grid_size() {
+            for (grid_size, expected_bodies, expected_joints) in [
+                (10, 280, 360),
+                (25, 1_825, 2_400),
+                (50, 7_400, 9_800),
+                (100, 29_800, 39_600),
+            ] {
+                assert_eq!(net_body_count(grid_size), expected_bodies);
+                assert_eq!(joint_count(grid_size), expected_joints);
+            }
         }
     }
 }
@@ -560,7 +611,8 @@ mod platform {
     #[wasm_bindgen(module = "/src/physx_bridge.js")]
     extern "C" {
         fn physx_begin_load();
-        fn physx_reset(scene_id: u32);
+        fn physx_reset(scene_id: u32, grid_size: usize);
+        fn physx_clear();
         fn physx_step(dt: f32);
         fn physx_refresh_transforms();
         fn physx_transforms() -> Float32Array;
@@ -581,15 +633,24 @@ mod platform {
             }
         }
 
-        pub fn reset(&mut self, scene: DemoScene) {
+        pub fn reset(&mut self, scene: DemoScene, grid_size: usize) {
             self.body_transforms.clear();
             self.packed_transforms.clear();
-            physx_reset(match scene {
-                DemoScene::JointGrid => 1,
-                DemoScene::CylinderDrape => 2,
-                DemoScene::FallingBalls => 3,
-            });
+            physx_reset(
+                match scene {
+                    DemoScene::JointGrid => 1,
+                    DemoScene::CylinderDrape => 2,
+                    DemoScene::FallingBalls => 3,
+                },
+                grid_size,
+            );
             self.refresh_body_transforms();
+        }
+
+        pub fn clear(&mut self) {
+            self.body_transforms.clear();
+            self.packed_transforms.clear();
+            physx_clear();
         }
 
         pub fn step(&mut self, dt: f32) {

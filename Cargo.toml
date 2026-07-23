@@ -2,7 +2,7 @@
 name = "m-abd-joint-net"
 version = "0.1.0"
 edition = "2024"
-description = "A minimal M-ABD and PhysX 10x10 ball-joint net comparison for native and web"
+description = "A scalable M-ABD and PhysX ball-joint net comparison for native and web"
 
 [dependencies]
 bevy = "0.19"

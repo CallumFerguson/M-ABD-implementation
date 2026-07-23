@@ -10,7 +10,8 @@ mod physx_demo;
 
 use physx_demo::PhysxDemo;
 
-const GRID_SIZE: usize = 10;
+const DEFAULT_GRID_SIZE: usize = 10;
+const GRID_SIZE_OPTIONS: [usize; 4] = [10, 25, 50, 100];
 const GRID_SPACING: f64 = 0.55;
 const DEFAULT_FIXED_HZ: f64 = 30.0;
 const FIXED_HZ_OPTIONS: [f64; 5] = [30.0, 60.0, 120.0, 200.0, 500.0];
@@ -34,6 +35,20 @@ const CONTACT_EPSILON: f64 = 1.0e-12;
 const HUB_CENTER: [f64; 4] = [0.25, 0.25, 0.25, 0.25];
 const ROD_START: [f64; 4] = [0.5, 0.5, 0.0, 0.0];
 const ROD_END: [f64; 4] = [0.0, 0.0, 0.5, 0.5];
+
+pub(crate) fn grid_span(grid_size: usize) -> f64 {
+    grid_size.saturating_sub(1) as f64 * GRID_SPACING
+}
+
+pub(crate) fn cylinder_origin_z(grid_size: usize) -> f64 {
+    let default_center_offset = -2.30 + grid_span(DEFAULT_GRID_SIZE) * 0.5;
+    -grid_span(grid_size) * 0.5 + default_center_offset
+}
+
+pub(crate) fn cylinder_length(grid_size: usize) -> f64 {
+    let default_end_margin = CYLINDER_LENGTH as f64 - grid_span(DEFAULT_GRID_SIZE);
+    grid_span(grid_size) + default_end_margin
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DemoScene {
@@ -79,6 +94,7 @@ impl SimulationBackend {
 struct ActiveDemo {
     scene: DemoScene,
     backend: SimulationBackend,
+    grid_size: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -215,11 +231,13 @@ struct CylinderCollider {
     origin: DVec3,
     axis: DVec3,
     radius: f64,
+    length: f64,
 }
 
 #[derive(Resource)]
 struct NetSimulation {
     scene: DemoScene,
+    grid_size: usize,
     bodies: Vec<AffineBody>,
     joints: Vec<BallJoint>,
     cylinder: Option<CylinderCollider>,
@@ -233,10 +251,17 @@ struct SimulationTiming {
 
 impl NetSimulation {
     fn new(scene: DemoScene) -> Self {
-        let mut bodies = Vec::with_capacity(3 * GRID_SIZE * GRID_SIZE - 2 * GRID_SIZE + 3);
-        let mut joints = Vec::with_capacity(4 * GRID_SIZE * (GRID_SIZE - 1));
-        let mut hubs = [[0usize; GRID_SIZE]; GRID_SIZE];
-        let mut node_positions = [[DVec3::ZERO; GRID_SIZE]; GRID_SIZE];
+        Self::with_grid_size(scene, DEFAULT_GRID_SIZE)
+    }
+
+    fn with_grid_size(scene: DemoScene, grid_size: usize) -> Self {
+        assert!(grid_size >= 2, "grid size must be at least 2x2");
+
+        let ball_count = usize::from(scene == DemoScene::FallingBalls) * 3;
+        let mut bodies = Vec::with_capacity(3 * grid_size * grid_size - 2 * grid_size + ball_count);
+        let mut joints = Vec::with_capacity(4 * grid_size * (grid_size - 1));
+        let mut hubs = vec![0usize; grid_size * grid_size];
+        let mut node_positions = vec![DVec3::ZERO; grid_size * grid_size];
         let hub_rest_points = hub_rest_points();
         let grid_height = if scene == DemoScene::FallingBalls {
             1.70
@@ -244,11 +269,11 @@ impl NetSimulation {
             3.0
         };
 
-        for row in 0..GRID_SIZE {
-            for column in 0..GRID_SIZE {
-                let x = (column as f64 - (GRID_SIZE - 1) as f64 * 0.5) * GRID_SPACING;
+        for row in 0..grid_size {
+            for column in 0..grid_size {
+                let x = (column as f64 - (grid_size - 1) as f64 * 0.5) * GRID_SPACING;
                 let z = if scene == DemoScene::FallingBalls {
-                    (row as f64 - (GRID_SIZE - 1) as f64 * 0.5) * GRID_SPACING
+                    (row as f64 - (grid_size - 1) as f64 * 0.5) * GRID_SPACING
                 } else {
                     -(row as f64) * GRID_SPACING
                 };
@@ -256,14 +281,15 @@ impl NetSimulation {
                 let fixed = match scene {
                     DemoScene::JointGrid | DemoScene::CylinderDrape => row == 0,
                     DemoScene::FallingBalls => {
-                        (row == 0 || row == GRID_SIZE - 1)
-                            && (column == 0 || column == GRID_SIZE - 1)
+                        (row == 0 || row == grid_size - 1)
+                            && (column == 0 || column == grid_size - 1)
                     }
                 };
                 let body_index = bodies.len();
+                let node_index = row * grid_size + column;
 
-                node_positions[row][column] = position;
-                hubs[row][column] = body_index;
+                node_positions[node_index] = position;
+                hubs[node_index] = body_index;
                 bodies.push(AffineBody::new(
                     BodyKind::Hub { fixed },
                     hub_rest_points,
@@ -275,39 +301,44 @@ impl NetSimulation {
             }
         }
 
-        for row in 0..GRID_SIZE {
-            for column in 0..(GRID_SIZE - 1) {
+        for row in 0..grid_size {
+            for column in 0..(grid_size - 1) {
+                let start = row * grid_size + column;
+                let end = start + 1;
                 add_rod(
                     &mut bodies,
                     &mut joints,
-                    hubs[row][column],
-                    hubs[row][column + 1],
-                    node_positions[row][column],
-                    node_positions[row][column + 1],
+                    hubs[start],
+                    hubs[end],
+                    node_positions[start],
+                    node_positions[end],
                 );
             }
         }
 
-        for row in 0..(GRID_SIZE - 1) {
-            for column in 0..GRID_SIZE {
+        for row in 0..(grid_size - 1) {
+            for column in 0..grid_size {
+                let start = row * grid_size + column;
+                let end = start + grid_size;
                 add_rod(
                     &mut bodies,
                     &mut joints,
-                    hubs[row][column],
-                    hubs[row + 1][column],
-                    node_positions[row][column],
-                    node_positions[row + 1][column],
+                    hubs[start],
+                    hubs[end],
+                    node_positions[start],
+                    node_positions[end],
                 );
             }
         }
 
-        debug_assert_eq!(bodies.len(), 280);
-        debug_assert_eq!(joints.len(), 360);
+        debug_assert_eq!(bodies.len(), 3 * grid_size * grid_size - 2 * grid_size);
+        debug_assert_eq!(joints.len(), 4 * grid_size * (grid_size - 1));
 
         let cylinder = (scene == DemoScene::CylinderDrape).then_some(CylinderCollider {
-            origin: DVec3::new(0.0, 1.75, -2.30),
+            origin: DVec3::new(0.0, 1.75, cylinder_origin_z(grid_size)),
             axis: DVec3::X,
             radius: CYLINDER_RADIUS as f64,
+            length: cylinder_length(grid_size),
         });
         let mut ball_indices = Vec::new();
 
@@ -331,6 +362,7 @@ impl NetSimulation {
 
         Self {
             scene,
+            grid_size,
             bodies,
             joints,
             cylinder,
@@ -397,6 +429,9 @@ struct PerformanceOverlay;
 #[derive(Component)]
 struct FixedHzButton(f64);
 
+#[derive(Component)]
+struct GridSizeButton(usize);
+
 #[derive(Resource)]
 struct VisualAssets {
     hub_mesh: Handle<Mesh>,
@@ -418,6 +453,7 @@ fn main() {
         .insert_resource(ActiveDemo {
             scene: DemoScene::JointGrid,
             backend: SimulationBackend::Project,
+            grid_size: DEFAULT_GRID_SIZE,
         })
         .insert_resource(NetSimulation::new(DemoScene::JointGrid))
         .init_resource::<SimulationTiming>()
@@ -442,6 +478,7 @@ fn main() {
                 switch_demo_scene,
                 change_fixed_hz,
                 style_fixed_hz_buttons,
+                style_grid_size_buttons,
                 ApplyDeferred,
                 refresh_physx_transforms,
                 sync_body_visuals,
@@ -515,13 +552,13 @@ fn setup_scene(
 
     commands.spawn((
         Camera3d::default(),
-        camera_transform(simulation.scene),
+        camera_transform(simulation.scene, simulation.grid_size),
         MainCamera,
     ));
 
     commands.spawn((
         Text::new(format!(
-            "SCENE 1/{DEMO_COUNT}  Joint grid\nBACKEND  PROJECT\nFPS       --\nFRAME     -- ms\nSIM STEP  -- ms\nFIXED    {DEFAULT_FIXED_HZ:>5.0} Hz\n280 bodies | 360 joints\n[1] Grid  [2] Cylinder  [3] Balls  [B] Backend  [R] Reset"
+            "SCENE 1/{DEMO_COUNT}  Joint grid\nBACKEND  PROJECT\nGRID     {DEFAULT_GRID_SIZE}x{DEFAULT_GRID_SIZE}\nFPS       --\nFRAME     -- ms\nSIM STEP  -- ms\nFIXED    {DEFAULT_FIXED_HZ:>5.0} Hz\n280 bodies | 360 joints\n[1] Grid  [2] Cylinder  [3] Balls  [B] Backend  [R] Reset"
         )),
         TextFont {
             font_size: FontSize::Px(15.0),
@@ -591,6 +628,57 @@ fn setup_scene(
                     ));
             }
         });
+
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(16.0),
+                bottom: px(16.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px(8.0),
+                padding: UiRect::axes(px(12.0), px(9.0)),
+                border_radius: BorderRadius::all(px(8.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.015, 0.025, 0.045, 0.82)),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("GRID"),
+                TextFont {
+                    font_size: FontSize::Px(14.0),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.70, 0.77, 0.89)),
+            ));
+
+            for grid_size in GRID_SIZE_OPTIONS {
+                parent
+                    .spawn((
+                        Button,
+                        GridSizeButton(grid_size),
+                        Node {
+                            width: px(if grid_size == 100 { 76.0 } else { 66.0 }),
+                            height: px(32.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(px(6.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.09, 0.14, 0.22)),
+                    ))
+                    .with_child((
+                        Text::new(format!("{grid_size}x{grid_size}")),
+                        TextFont {
+                            font_size: FontSize::Px(14.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(0.88, 0.92, 1.0)),
+                    ));
+            }
+        });
 }
 
 fn spawn_scene_visuals(commands: &mut Commands, simulation: &NetSimulation, assets: &VisualAssets) {
@@ -620,7 +708,12 @@ fn spawn_scene_visuals(commands: &mut Commands, simulation: &NetSimulation, asse
             Mesh3d(assets.cylinder_mesh.clone()),
             MeshMaterial3d(assets.cylinder_material.clone()),
             Transform::from_translation(cylinder.origin.as_vec3())
-                .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
+                .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))
+                .with_scale(Vec3::new(
+                    1.0,
+                    cylinder.length as f32 / CYLINDER_LENGTH,
+                    1.0,
+                )),
             SceneVisual,
         ));
     }
@@ -634,19 +727,28 @@ fn switch_demo_scene(
     mut physx: NonSendMut<PhysxDemo>,
     mut timing: ResMut<SimulationTiming>,
     assets: Res<VisualAssets>,
+    grid_buttons: Query<(&Interaction, &GridSizeButton), Changed<Interaction>>,
     scene_visuals: Query<Entity, With<SceneVisual>>,
     mut camera: Query<&mut Transform, With<MainCamera>>,
 ) {
-    let (target_scene, target_backend) = if keys.just_pressed(KeyCode::Digit1) {
-        (DemoScene::JointGrid, active.backend)
+    let selected_grid_size = grid_buttons.iter().find_map(|(interaction, button)| {
+        (*interaction == Interaction::Pressed).then_some(button.0)
+    });
+    let (target_scene, target_backend, target_grid_size) = if keys.just_pressed(KeyCode::Digit1) {
+        (DemoScene::JointGrid, active.backend, active.grid_size)
     } else if keys.just_pressed(KeyCode::Digit2) {
-        (DemoScene::CylinderDrape, active.backend)
+        (DemoScene::CylinderDrape, active.backend, active.grid_size)
     } else if keys.just_pressed(KeyCode::Digit3) {
-        (DemoScene::FallingBalls, active.backend)
+        (DemoScene::FallingBalls, active.backend, active.grid_size)
     } else if keys.just_pressed(KeyCode::KeyB) {
-        (active.scene, active.backend.toggled())
+        (active.scene, active.backend.toggled(), active.grid_size)
     } else if keys.just_pressed(KeyCode::KeyR) {
-        (active.scene, active.backend)
+        (active.scene, active.backend, active.grid_size)
+    } else if let Some(grid_size) = selected_grid_size {
+        if grid_size == active.grid_size {
+            return;
+        }
+        (active.scene, active.backend, grid_size)
     } else {
         return;
     };
@@ -655,18 +757,21 @@ fn switch_demo_scene(
         commands.entity(entity).despawn();
     }
 
-    let next_simulation = NetSimulation::new(target_scene);
+    let next_simulation = NetSimulation::with_grid_size(target_scene, target_grid_size);
     if target_backend == SimulationBackend::Physx {
-        physx.reset(target_scene);
+        physx.reset(target_scene, target_grid_size);
+    } else {
+        physx.clear();
     }
     spawn_scene_visuals(&mut commands, &next_simulation, &assets);
     *simulation = next_simulation;
     active.scene = target_scene;
     active.backend = target_backend;
+    active.grid_size = target_grid_size;
     *timing = SimulationTiming::default();
 
     if let Ok(mut transform) = camera.single_mut() {
-        *transform = camera_transform(target_scene);
+        *transform = camera_transform(target_scene, target_grid_size);
     }
 }
 
@@ -698,18 +803,49 @@ fn style_fixed_hz_buttons(
     }
 }
 
-fn camera_transform(scene: DemoScene) -> Transform {
-    match scene {
-        DemoScene::JointGrid => {
-            Transform::from_xyz(7.2, 4.6, 10.5).looking_at(Vec3::new(0.0, 0.7, -2.2), Vec3::Y)
-        }
-        DemoScene::CylinderDrape => {
-            Transform::from_xyz(7.2, 5.0, 10.5).looking_at(Vec3::new(0.0, 1.6, -2.3), Vec3::Y)
-        }
-        DemoScene::FallingBalls => {
-            Transform::from_xyz(7.4, 5.7, 8.8).looking_at(Vec3::new(0.0, 1.8, 0.0), Vec3::Y)
-        }
+fn style_grid_size_buttons(
+    active: Res<ActiveDemo>,
+    mut buttons: Query<(&Interaction, &GridSizeButton, &mut BackgroundColor)>,
+) {
+    for (interaction, button, mut background) in &mut buttons {
+        let selected = button.0 == active.grid_size;
+        *background = match *interaction {
+            Interaction::Pressed => Color::srgb(0.16, 0.58, 0.96).into(),
+            Interaction::Hovered => Color::srgb(0.15, 0.27, 0.43).into(),
+            Interaction::None if selected => Color::srgb(0.04, 0.48, 0.86).into(),
+            Interaction::None => Color::srgb(0.09, 0.14, 0.22).into(),
+        };
     }
+}
+
+fn camera_transform(scene: DemoScene, grid_size: usize) -> Transform {
+    let scale = (grid_span(grid_size) / grid_span(DEFAULT_GRID_SIZE)).max(1.0) as f32;
+
+    match scene {
+        DemoScene::JointGrid => scaled_camera(
+            Vec3::new(7.2, 4.6, 10.5),
+            Vec3::new(0.0, 0.7, -2.2),
+            Vec3::new(0.0, 0.7, (-grid_span(grid_size) * 0.5 + 0.275) as f32),
+            scale,
+        ),
+        DemoScene::CylinderDrape => scaled_camera(
+            Vec3::new(7.2, 5.0, 10.5),
+            Vec3::new(0.0, 1.6, -2.3),
+            Vec3::new(0.0, 1.6, cylinder_origin_z(grid_size) as f32),
+            scale,
+        ),
+        DemoScene::FallingBalls => scaled_camera(
+            Vec3::new(7.4, 5.7, 8.8),
+            Vec3::new(0.0, 1.8, 0.0),
+            Vec3::new(0.0, 1.8, 0.0),
+            scale,
+        ),
+    }
+}
+
+fn scaled_camera(base_position: Vec3, base_target: Vec3, target: Vec3, scale: f32) -> Transform {
+    Transform::from_translation(target + (base_position - base_target) * scale)
+        .looking_at(target, Vec3::Y)
 }
 
 fn step_simulation(
@@ -807,10 +943,12 @@ fn update_performance_overlay(
 
     for mut text in &mut overlays {
         text.0 = format!(
-            "SCENE {}/{}  {}\nBACKEND  {backend}\nFPS      {fps}\nFRAME    {frame_time} ms\nSIM STEP {:>5.2} ms\nFIXED    {fixed_hz:>5.0} Hz\n{} bodies | {} joints\n[1] Grid  [2] Cylinder  [3] Balls  [B] Backend  [R] Reset",
+            "SCENE {}/{}  {}\nBACKEND  {backend}\nGRID     {}x{}\nFPS      {fps}\nFRAME    {frame_time} ms\nSIM STEP {:>5.2} ms\nFIXED    {fixed_hz:>5.0} Hz\n{} bodies | {} joints\n[1] Grid  [2] Cylinder  [3] Balls  [B] Backend  [R] Reset",
             active.scene.number(),
             DEMO_COUNT,
             active.scene.title(),
+            active.grid_size,
+            active.grid_size,
             timing.latest_step_ms,
             simulation.bodies.len(),
             simulation.joints.len(),
@@ -1360,6 +1498,23 @@ mod tests {
     }
 
     #[test]
+    fn builds_each_supported_grid_topology() {
+        for grid_size in GRID_SIZE_OPTIONS {
+            let simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, grid_size);
+            let expected_bodies = 3 * grid_size * grid_size - 2 * grid_size;
+            let expected_joints = 4 * grid_size * (grid_size - 1);
+
+            assert_eq!(simulation.grid_size, grid_size);
+            assert_eq!(simulation.bodies.len(), expected_bodies);
+            assert_eq!(simulation.joints.len(), expected_joints);
+            assert_eq!(
+                simulation.bodies.iter().filter(|body| body.fixed).count(),
+                grid_size
+            );
+        }
+    }
+
+    #[test]
     fn ball_joints_remain_closed_under_gravity() {
         let mut simulation = NetSimulation::new(DemoScene::JointGrid);
 
@@ -1376,7 +1531,8 @@ mod tests {
                 .length()
             })
             .fold(0.0_f64, f64::max);
-        let bottom_hub_height = simulation.bodies[GRID_SIZE * (GRID_SIZE - 1) + GRID_SIZE / 2]
+        let bottom_hub_height = simulation.bodies
+            [DEFAULT_GRID_SIZE * (DEFAULT_GRID_SIZE - 1) + DEFAULT_GRID_SIZE / 2]
             .centroid()
             .y;
         let maximum_shape_error = simulation
@@ -1488,6 +1644,7 @@ mod tests {
             origin: DVec3::ZERO,
             axis: DVec3::X,
             radius: 0.7,
+            length: 5.8,
         };
         let mut bodies = vec![test_body(DVec3::new(0.0, 0.2, 0.0), false)];
 
