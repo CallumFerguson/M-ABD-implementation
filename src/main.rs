@@ -246,6 +246,31 @@ struct NetSimulation {
     joints: Vec<BallJoint>,
     cylinder: Option<CylinderCollider>,
     ball_indices: Vec<usize>,
+    solver_scratch: SolverScratch,
+}
+
+struct SolverScratch {
+    constraint_residual: Vec<DVec3>,
+    solution: Vec<DVec3>,
+    preconditioned: Vec<DVec3>,
+    direction: Vec<DVec3>,
+    matrix_direction: Vec<DVec3>,
+    body_forces: Vec<[DVec3; 4]>,
+    joint_diagonal: Vec<f64>,
+}
+
+impl SolverScratch {
+    fn new(body_count: usize, joint_count: usize) -> Self {
+        Self {
+            constraint_residual: vec![DVec3::ZERO; joint_count],
+            solution: vec![DVec3::ZERO; joint_count],
+            preconditioned: vec![DVec3::ZERO; joint_count],
+            direction: vec![DVec3::ZERO; joint_count],
+            matrix_direction: vec![DVec3::ZERO; joint_count],
+            body_forces: vec![[DVec3::ZERO; 4]; body_count],
+            joint_diagonal: vec![0.0; joint_count],
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -364,6 +389,8 @@ impl NetSimulation {
             }
         }
 
+        let solver_scratch = SolverScratch::new(bodies.len(), joints.len());
+
         Self {
             scene,
             grid_size,
@@ -371,6 +398,7 @@ impl NetSimulation {
             joints,
             cylinder,
             ball_indices,
+            solver_scratch,
         }
     }
 
@@ -379,22 +407,39 @@ impl NetSimulation {
             body.predict(dt);
         }
 
+        for (diagonal, joint) in self
+            .solver_scratch
+            .joint_diagonal
+            .iter_mut()
+            .zip(&self.joints)
+        {
+            *diagonal = (attachment_inverse_weight(&self.bodies, joint.a)
+                + attachment_inverse_weight(&self.bodies, joint.b))
+            .max(1.0e-16);
+        }
+
         for _ in 0..COROTATED_ITERATIONS {
             for body in &mut self.bodies {
                 body.project_corotated_shape(dt);
             }
 
-            let constraint_residual: Vec<DVec3> = self
-                .joints
-                .iter()
-                .map(|joint| {
-                    attachment_position(&self.bodies, joint.a)
-                        - attachment_position(&self.bodies, joint.b)
-                })
-                .collect();
+            for (residual, joint) in self
+                .solver_scratch
+                .constraint_residual
+                .iter_mut()
+                .zip(&self.joints)
+            {
+                *residual = attachment_position(&self.bodies, joint.a)
+                    - attachment_position(&self.bodies, joint.b);
+            }
 
-            let multipliers = solve_dual_pcg(&self.bodies, &self.joints, &constraint_residual);
-            apply_joint_correction(&mut self.bodies, &self.joints, &multipliers);
+            solve_dual_pcg(&self.bodies, &self.joints, &mut self.solver_scratch);
+            apply_joint_correction(
+                &mut self.bodies,
+                &self.joints,
+                &self.solver_scratch.solution,
+                &mut self.solver_scratch.body_forces,
+            );
 
             for _ in 0..CONTACT_PASSES {
                 match self.scene {
@@ -1281,40 +1326,33 @@ fn safe_normal(primary: DVec3, secondary: DVec3, fallback: DVec3) -> DVec3 {
     }
 }
 
-fn solve_dual_pcg(
-    bodies: &[AffineBody],
-    joints: &[BallJoint],
-    right_hand_side: &[DVec3],
-) -> Vec<DVec3> {
-    let mut solution = vec![DVec3::ZERO; joints.len()];
-    let mut residual = right_hand_side.to_vec();
-    let mut preconditioned = vec![DVec3::ZERO; joints.len()];
-    let mut direction = vec![DVec3::ZERO; joints.len()];
-    let mut matrix_direction = vec![DVec3::ZERO; joints.len()];
-    let mut body_forces = vec![[DVec3::ZERO; 4]; bodies.len()];
+fn solve_dual_pcg(bodies: &[AffineBody], joints: &[BallJoint], scratch: &mut SolverScratch) {
+    let SolverScratch {
+        constraint_residual: residual,
+        solution,
+        preconditioned,
+        direction,
+        matrix_direction,
+        body_forces,
+        joint_diagonal,
+    } = scratch;
 
-    for (index, joint) in joints.iter().enumerate() {
-        let diagonal =
-            attachment_inverse_weight(bodies, joint.a) + attachment_inverse_weight(bodies, joint.b);
-        preconditioned[index] = residual[index] / diagonal.max(1.0e-16);
+    solution.fill(DVec3::ZERO);
+
+    for index in 0..joints.len() {
+        preconditioned[index] = residual[index] / joint_diagonal[index];
         direction[index] = preconditioned[index];
     }
 
     let initial_norm = vector_dot(&residual, &residual).sqrt();
     if initial_norm <= 1.0e-12 {
-        return solution;
+        return;
     }
 
     let mut residual_dot_preconditioned = vector_dot(&residual, &preconditioned);
 
     for _ in 0..MAX_PCG_ITERATIONS {
-        apply_dual_matrix(
-            bodies,
-            joints,
-            &direction,
-            &mut matrix_direction,
-            &mut body_forces,
-        );
+        apply_dual_matrix(bodies, joints, &direction, matrix_direction, body_forces);
 
         let denominator = vector_dot(&direction, &matrix_direction);
         if denominator.abs() <= 1.0e-20 {
@@ -1331,10 +1369,8 @@ fn solve_dual_pcg(
             break;
         }
 
-        for (index, joint) in joints.iter().enumerate() {
-            let diagonal = attachment_inverse_weight(bodies, joint.a)
-                + attachment_inverse_weight(bodies, joint.b);
-            preconditioned[index] = residual[index] / diagonal.max(1.0e-16);
+        for index in 0..joints.len() {
+            preconditioned[index] = residual[index] / joint_diagonal[index];
         }
 
         let next_residual_dot_preconditioned = vector_dot(&residual, &preconditioned);
@@ -1345,8 +1381,6 @@ fn solve_dual_pcg(
             direction[index] = preconditioned[index] + direction[index] * beta;
         }
     }
-
-    solution
 }
 
 fn apply_dual_matrix(
@@ -1379,8 +1413,13 @@ fn apply_dual_matrix(
     }
 }
 
-fn apply_joint_correction(bodies: &mut [AffineBody], joints: &[BallJoint], multipliers: &[DVec3]) {
-    let mut body_forces = vec![[DVec3::ZERO; 4]; bodies.len()];
+fn apply_joint_correction(
+    bodies: &mut [AffineBody],
+    joints: &[BallJoint],
+    multipliers: &[DVec3],
+    body_forces: &mut [[DVec3; 4]],
+) {
+    body_forces.fill([DVec3::ZERO; 4]);
 
     for (joint, multiplier) in joints.iter().zip(multipliers) {
         accumulate_attachment(&mut body_forces[joint.a.body], joint.a.weights, *multiplier);
@@ -1391,12 +1430,12 @@ fn apply_joint_correction(bodies: &mut [AffineBody], joints: &[BallJoint], multi
         );
     }
 
-    for (body, forces) in bodies.iter_mut().zip(body_forces) {
+    for (body, forces) in bodies.iter_mut().zip(body_forces.iter()) {
         if body.fixed {
             continue;
         }
-        for (position, force) in body.positions.iter_mut().zip(forces) {
-            *position -= force * body.inverse_diagonal;
+        for (position, force) in body.positions.iter_mut().zip(forces.iter()) {
+            *position -= *force * body.inverse_diagonal;
         }
     }
 }
