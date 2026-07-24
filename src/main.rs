@@ -1099,10 +1099,7 @@ fn add_rod(
 }
 
 fn project_cylinder_contacts(bodies: &mut [AffineBody], cylinder: CylinderCollider) {
-    let axis = cylinder.axis.normalize_or_zero();
-    if axis.length_squared() <= CONTACT_EPSILON {
-        return;
-    }
+    debug_assert_eq!(cylinder.axis, DVec3::X);
 
     for body_index in 0..bodies.len() {
         match bodies[body_index].kind {
@@ -1114,16 +1111,24 @@ fn project_cylinder_contacts(bodies: &mut [AffineBody], cylinder: CylinderCollid
                 },
                 HUB_RADIUS as f64,
                 cylinder.origin,
-                axis,
                 cylinder.radius,
             ),
             BodyKind::Rod => {
                 let (start, end) = rod_collider_attachments(body_index);
                 let start_position = attachment_position(bodies, start);
                 let end_position = attachment_position(bodies, end);
-                let start_radial = reject_from_axis(start_position - cylinder.origin, axis);
+                let start_radial = reject_from_x_axis(start_position - cylinder.origin);
                 let direction = end_position - start_position;
-                let direction_radial = reject_from_axis(direction, axis);
+                let direction_radial = reject_from_x_axis(direction);
+                let contact_distance = cylinder.radius + ROD_THICKNESS as f64 * 0.5;
+                let radial_midpoint = start_radial + direction_radial * 0.5;
+                let radial_half_extents =
+                    direction_radial.abs() * 0.5 + DVec3::splat(contact_distance);
+                if radial_midpoint.y.abs() > radial_half_extents.y
+                    || radial_midpoint.z.abs() > radial_half_extents.z
+                {
+                    continue;
+                }
                 let denominator = direction_radial.length_squared();
                 let t = if denominator > CONTACT_EPSILON {
                     (-start_radial.dot(direction_radial) / denominator).clamp(0.0, 1.0)
@@ -1131,7 +1136,6 @@ fn project_cylinder_contacts(bodies: &mut [AffineBody], cylinder: CylinderCollid
                     0.5
                 };
                 let radial = start_radial + direction_radial * t;
-                let contact_distance = cylinder.radius + ROD_THICKNESS as f64 * 0.5;
                 let distance_squared = radial.length_squared();
                 if distance_squared < contact_distance * contact_distance {
                     project_penetrating_attachment_against_cylinder(
@@ -1141,7 +1145,6 @@ fn project_cylinder_contacts(bodies: &mut [AffineBody], cylinder: CylinderCollid
                         distance_squared,
                         contact_distance,
                         cylinder.origin,
-                        axis,
                     );
                 }
             }
@@ -1155,18 +1158,16 @@ fn project_attachment_against_cylinder(
     attachment: Attachment,
     proxy_radius: f64,
     cylinder_origin: DVec3,
-    cylinder_axis: DVec3,
     cylinder_radius: f64,
 ) {
     let position = attachment_position(bodies, attachment);
-    let radial = reject_from_axis(position - cylinder_origin, cylinder_axis);
+    let radial = reject_from_x_axis(position - cylinder_origin);
     project_attachment_against_cylinder_at_radial(
         bodies,
         attachment,
         radial,
         proxy_radius,
         cylinder_origin,
-        cylinder_axis,
         cylinder_radius,
     );
 }
@@ -1177,7 +1178,6 @@ fn project_attachment_against_cylinder_at_radial(
     radial: DVec3,
     proxy_radius: f64,
     cylinder_origin: DVec3,
-    cylinder_axis: DVec3,
     cylinder_radius: f64,
 ) {
     let contact_distance = cylinder_radius + proxy_radius;
@@ -1192,7 +1192,6 @@ fn project_attachment_against_cylinder_at_radial(
         distance_squared,
         contact_distance,
         cylinder_origin,
-        cylinder_axis,
     );
 }
 
@@ -1203,7 +1202,6 @@ fn project_penetrating_attachment_against_cylinder(
     distance_squared: f64,
     contact_distance: f64,
     cylinder_origin: DVec3,
-    cylinder_axis: DVec3,
 ) {
     let distance = distance_squared.sqrt();
     let penetration = contact_distance - distance;
@@ -1211,8 +1209,8 @@ fn project_penetrating_attachment_against_cylinder(
         radial / distance
     } else {
         let previous = previous_attachment_position(bodies, attachment);
-        let previous_radial = reject_from_axis(previous - cylinder_origin, cylinder_axis);
-        safe_normal(radial, previous_radial, perpendicular_to(cylinder_axis))
+        let previous_radial = reject_from_x_axis(previous - cylinder_origin);
+        safe_normal(radial, previous_radial, DVec3::Y)
     };
     project_static_attachment(bodies, attachment, normal, penetration);
 }
@@ -1601,10 +1599,17 @@ fn previous_attachment_position(bodies: &[AffineBody], attachment: Attachment) -
     )
 }
 
+#[cfg(test)]
 fn reject_from_axis(vector: DVec3, axis: DVec3) -> DVec3 {
     vector - axis * vector.dot(axis)
 }
 
+#[inline]
+fn reject_from_x_axis(vector: DVec3) -> DVec3 {
+    DVec3::new(0.0, vector.y, vector.z)
+}
+
+#[cfg(test)]
 fn perpendicular_to(axis: DVec3) -> DVec3 {
     let candidate = if axis.y.abs() < 0.9 {
         DVec3::Y
@@ -2042,9 +2047,9 @@ mod tests {
         assert!(grid_size >= 2, "benchmark grid must be at least 2x2");
         let (batches, warmup_steps, measured_steps) = match grid_size {
             2..=10 => (7, 20, 10),
-            11..=25 => (5, 8, 5),
-            26..=50 => (5, 4, 3),
-            _ => (3, 2, 2),
+            11..=25 => (5, 20, 5),
+            26..=50 => (3, 20, 3),
+            _ => (3, 20, 2),
         };
         let mut samples = Vec::with_capacity(batches);
 
