@@ -126,7 +126,6 @@ struct AffineBody {
     positions: [DVec3; 4],
     previous_positions: [DVec3; 4],
     predicted_positions: [DVec3; 4],
-    velocities: [DVec3; 4],
     inertia: f64,
     inverse_diagonal: f64,
 }
@@ -147,7 +146,6 @@ impl AffineBody {
             positions,
             previous_positions: positions,
             predicted_positions: positions,
-            velocities: [DVec3::ZERO; 4],
             inertia: 0.0,
             inverse_diagonal: 0.0,
         }
@@ -178,21 +176,21 @@ impl AffineBody {
     #[cfg(test)]
     fn predict(&mut self, dt: f64) {
         self.update_time_step_coefficients(dt);
-        self.predict_positions(dt);
+        self.predict_positions(dt, 0.0);
     }
 
-    fn predict_positions(&mut self, dt: f64) {
-        self.previous_positions = self.positions;
-
+    fn predict_positions(&mut self, dt: f64, previous_velocity_scale: f64) {
         if self.fixed {
+            self.previous_positions = self.positions;
             self.predicted_positions = self.positions;
-            self.velocities = [DVec3::ZERO; 4];
             return;
         }
 
         for index in 0..4 {
-            self.predicted_positions[index] =
-                self.positions[index] + self.velocities[index] * dt + GRAVITY * (dt * dt);
+            let position = self.positions[index];
+            let velocity = (position - self.previous_positions[index]) * previous_velocity_scale;
+            self.previous_positions[index] = position;
+            self.predicted_positions[index] = position + velocity * dt + GRAVITY * (dt * dt);
             self.positions[index] = self.predicted_positions[index];
         }
     }
@@ -279,18 +277,6 @@ impl AffineBody {
             self.positions[index] = (self.predicted_positions[index] * self.inertia
                 + rigid_target * AFFINE_STIFFNESS)
                 * self.inverse_diagonal;
-        }
-    }
-
-    fn finish_step(&mut self, velocity_scale: f64) {
-        if self.fixed {
-            self.velocities = [DVec3::ZERO; 4];
-            return;
-        }
-
-        for index in 0..4 {
-            self.velocities[index] =
-                (self.positions[index] - self.previous_positions[index]) * velocity_scale;
         }
     }
 }
@@ -385,6 +371,7 @@ struct NetSimulation {
     ball_indices: Vec<usize>,
     solver_scratch: SolverScratch,
     coefficient_dt_bits: u64,
+    previous_velocity_scale: f64,
 }
 
 struct SolverScratch {
@@ -552,6 +539,7 @@ impl NetSimulation {
             ball_indices,
             solver_scratch,
             coefficient_dt_bits: u64::MAX,
+            previous_velocity_scale: 0.0,
         }
     }
 
@@ -582,7 +570,7 @@ impl NetSimulation {
         }
 
         for body in &mut self.bodies {
-            body.predict_positions(dt);
+            body.predict_positions(dt, self.previous_velocity_scale);
         }
 
         for _ in 0..COROTATED_ITERATIONS {
@@ -640,10 +628,7 @@ impl NetSimulation {
             }
         }
 
-        let velocity_scale = velocity_damping_for_dt(dt) / dt;
-        for body in &mut self.bodies {
-            body.finish_step(velocity_scale);
-        }
+        self.previous_velocity_scale = velocity_damping_for_dt(dt) / dt;
     }
 }
 
@@ -3689,7 +3674,7 @@ mod tests {
             }
 
             let mut maximum_shape_error = 0.0_f64;
-            let mut maximum_velocity_spread = 0.0_f64;
+            let mut maximum_displacement_spread = 0.0_f64;
             for body in &simulation.bodies {
                 if !matches!(body.kind, BodyKind::Hub { .. } | BodyKind::Ball) {
                     continue;
@@ -3700,8 +3685,10 @@ mod tests {
                 for index in 0..4 {
                     maximum_shape_error = maximum_shape_error
                         .max((body.positions[index] - center - rest_points[index]).length());
-                    maximum_velocity_spread = maximum_velocity_spread
-                        .max((body.velocities[index] - body.velocities[0]).length());
+                    let displacement = body.positions[index] - body.previous_positions[index];
+                    let first_displacement = body.positions[0] - body.previous_positions[0];
+                    maximum_displacement_spread = maximum_displacement_spread
+                        .max((displacement - first_displacement).length());
                 }
             }
 
@@ -3711,8 +3698,8 @@ mod tests {
                 scene.title()
             );
             assert!(
-                maximum_velocity_spread < 1.0e-10,
-                "{} center-attached velocity spread: {maximum_velocity_spread}",
+                maximum_displacement_spread < 1.0e-10,
+                "{} center-attached displacement spread: {maximum_displacement_spread}",
                 scene.title()
             );
         }
@@ -3876,6 +3863,66 @@ mod tests {
     }
 
     #[test]
+    fn deferred_velocity_reconstruction_matches_explicit_recurrence() {
+        for fixed in [false, true] {
+            let mut deferred = AffineBody::new(
+                BodyKind::Rod,
+                rod_rest_points(),
+                DVec3::new(0.3, 1.7, -0.4),
+                DQuat::from_rotation_z(0.37),
+                fixed,
+            );
+            let mut explicit = deferred.clone();
+            let mut explicit_velocity = [DVec3::ZERO; 4];
+            let mut previous_velocity_scale = 0.0;
+
+            for (step, dt) in [1.0 / 30.0, 1.0 / 30.0, 1.0 / 60.0, 1.0 / 120.0, 1.0 / 30.0]
+                .into_iter()
+                .enumerate()
+            {
+                deferred.predict_positions(dt, previous_velocity_scale);
+
+                explicit.previous_positions = explicit.positions;
+                if fixed {
+                    explicit.predicted_positions = explicit.positions;
+                    explicit_velocity = [DVec3::ZERO; 4];
+                } else {
+                    for (index, velocity) in explicit_velocity.iter().enumerate() {
+                        explicit.predicted_positions[index] =
+                            explicit.positions[index] + *velocity * dt + GRAVITY * (dt * dt);
+                        explicit.positions[index] = explicit.predicted_positions[index];
+                    }
+                }
+
+                assert_eq!(deferred.positions, explicit.positions);
+                assert_eq!(deferred.previous_positions, explicit.previous_positions);
+                assert_eq!(deferred.predicted_positions, explicit.predicted_positions);
+
+                if !fixed {
+                    for index in 0..4 {
+                        let correction = DVec3::new(
+                            (step + index) as f64 * 1.0e-4,
+                            (2 * step + index) as f64 * -2.0e-4,
+                            (step + 3 * index) as f64 * 1.5e-4,
+                        );
+                        deferred.positions[index] += correction;
+                        explicit.positions[index] += correction;
+                    }
+                }
+
+                previous_velocity_scale = velocity_damping_for_dt(dt) / dt;
+                if !fixed {
+                    for (index, velocity) in explicit_velocity.iter_mut().enumerate() {
+                        *velocity = (explicit.positions[index]
+                            - explicit.previous_positions[index])
+                            * previous_velocity_scale;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cached_time_step_coefficients_match_forced_rebuilds() {
         for scene in [
             DemoScene::JointGrid,
@@ -3899,7 +3946,6 @@ mod tests {
                         cached_body.predicted_positions,
                         rebuilt_body.predicted_positions
                     );
-                    assert_eq!(cached_body.velocities, rebuilt_body.velocities);
                     assert_eq!(
                         cached_body.inertia.to_bits(),
                         rebuilt_body.inertia.to_bits()
@@ -3920,6 +3966,10 @@ mod tests {
                 assert_eq!(
                     cached.solver_scratch.hub_schur_factor,
                     rebuilt.solver_scratch.hub_schur_factor
+                );
+                assert_eq!(
+                    cached.previous_velocity_scale.to_bits(),
+                    rebuilt.previous_velocity_scale.to_bits()
                 );
             }
         }
@@ -4156,7 +4206,8 @@ mod tests {
         simulation.bodies.iter().all(|body| {
             body.positions
                 .iter()
-                .chain(&body.velocities)
+                .chain(&body.previous_positions)
+                .chain(&body.predicted_positions)
                 .all(|value| value.is_finite())
         })
     }
