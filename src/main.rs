@@ -1321,6 +1321,15 @@ fn project_ball_contacts(
                     let start_position = proxy_start[net_body_index];
                     let end_position = proxy_end[net_body_index];
                     let direction = end_position - start_position;
+                    let minimum_distance = BALL_RADIUS as f64 + ROD_THICKNESS as f64 * 0.5;
+                    if point_outside_capsule_bounds(
+                        sphere_position,
+                        start_position,
+                        direction,
+                        minimum_distance,
+                    ) {
+                        continue;
+                    }
                     let denominator = direction.length_squared();
                     let t = if denominator > CONTACT_EPSILON {
                         ((sphere_position - start_position).dot(direction) / denominator)
@@ -1336,7 +1345,7 @@ fn project_ball_contacts(
                         rod_attachment,
                         sphere_position,
                         start_position + direction * t,
-                        BALL_RADIUS as f64 + ROD_THICKNESS as f64 * 0.5,
+                        minimum_distance,
                         DVec3::Y,
                     )
                 }
@@ -1349,6 +1358,21 @@ fn project_ball_contacts(
             }
         }
     }
+}
+
+#[inline]
+fn point_outside_capsule_bounds(
+    point: DVec3,
+    segment_start: DVec3,
+    segment_direction: DVec3,
+    radius: f64,
+) -> bool {
+    let midpoint = segment_start + segment_direction * 0.5;
+    let half_extents = segment_direction.abs() * 0.5 + DVec3::splat(radius);
+    let midpoint_delta = (point - midpoint).abs();
+    midpoint_delta.x > half_extents.x
+        || midpoint_delta.y > half_extents.y
+        || midpoint_delta.z > half_extents.z
 }
 
 fn refresh_contact_proxy(
@@ -2163,38 +2187,36 @@ mod tests {
 
     #[test]
     fn cached_ball_contacts_match_uncached_ordered_projection() {
-        let mut simulation = NetSimulation::new(DemoScene::FallingBalls);
-        for _ in 0..20 {
-            simulation.step(1.0 / DEFAULT_FIXED_HZ);
+        for warmup_steps in [0, 20, 100] {
+            let mut simulation = NetSimulation::new(DemoScene::FallingBalls);
+            for _ in 0..warmup_steps {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let ball_indices = simulation.ball_indices.clone();
+            let mut cached = simulation.bodies.clone();
+            let mut uncached = simulation.bodies;
+            let mut proxy_start = vec![DVec3::ZERO; cached.len()];
+            let mut proxy_end = vec![DVec3::ZERO; cached.len()];
+            project_ball_contacts(&mut cached, &ball_indices, &mut proxy_start, &mut proxy_end);
+            project_ball_contacts_uncached(&mut uncached, &ball_indices);
+
+            let maximum_error = cached
+                .iter()
+                .zip(&uncached)
+                .flat_map(|(cached, uncached)| {
+                    cached
+                        .positions
+                        .iter()
+                        .zip(&uncached.positions)
+                        .map(|(cached, uncached)| (*cached - *uncached).length())
+                })
+                .fold(0.0_f64, f64::max);
+            assert!(
+                maximum_error < 1.0e-14,
+                "cached contact projection error after {warmup_steps} steps: {maximum_error}"
+            );
         }
-
-        let mut cached = simulation.bodies.clone();
-        let mut uncached = simulation.bodies;
-        let mut proxy_start = vec![DVec3::ZERO; cached.len()];
-        let mut proxy_end = vec![DVec3::ZERO; cached.len()];
-        project_ball_contacts(
-            &mut cached,
-            &simulation.ball_indices,
-            &mut proxy_start,
-            &mut proxy_end,
-        );
-        project_ball_contacts_uncached(&mut uncached, &simulation.ball_indices);
-
-        let maximum_error = cached
-            .iter()
-            .zip(&uncached)
-            .flat_map(|(cached, uncached)| {
-                cached
-                    .positions
-                    .iter()
-                    .zip(&uncached.positions)
-                    .map(|(cached, uncached)| (*cached - *uncached).length())
-            })
-            .fold(0.0_f64, f64::max);
-        assert!(
-            maximum_error < 1.0e-14,
-            "cached contact projection error: {maximum_error}"
-        );
     }
 
     #[test]
