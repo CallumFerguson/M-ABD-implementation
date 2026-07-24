@@ -497,7 +497,7 @@ impl NetSimulation {
                 self.grid_size * self.grid_size,
             );
 
-            solve_dual_direct(&self.joints, &mut self.solver_scratch);
+            solve_dual_direct(&self.joints, &mut self.solver_scratch, self.grid_size);
             apply_joint_correction(
                 &mut self.bodies,
                 &self.joints,
@@ -1922,7 +1922,7 @@ fn debug_validate_direct_solver_topology(bodies: &[AffineBody], joints: &[BallJo
 #[cfg(not(debug_assertions))]
 fn debug_validate_direct_solver_topology(_bodies: &[AffineBody], _joints: &[BallJoint]) {}
 
-fn solve_dual_direct(joints: &[BallJoint], scratch: &mut SolverScratch) {
+fn solve_dual_direct(joints: &[BallJoint], scratch: &mut SolverScratch, grid_size: usize) {
     let SolverScratch {
         constraint_residual: residual,
         solution,
@@ -1932,12 +1932,29 @@ fn solve_dual_direct(joints: &[BallJoint], scratch: &mut SolverScratch) {
         ..
     } = scratch;
 
-    hub_weighted_residual.fill(DVec3::ZERO);
-
-    for (index, joint) in joints.iter().enumerate() {
-        let hub = joint.b.body;
-        let inverse_rod_weight = joint_rod_inverse_weight[index];
-        hub_weighted_residual[hub] += residual[index] * inverse_rod_weight;
+    debug_assert_eq!(hub_weighted_residual.len(), grid_size * grid_size);
+    let horizontal_rod_count = grid_size * (grid_size - 1);
+    for row in 0..grid_size {
+        for column in 0..grid_size {
+            let mut weighted_residual = DVec3::ZERO;
+            if column > 0 {
+                let joint = 2 * (row * (grid_size - 1) + column - 1) + 1;
+                weighted_residual += residual[joint] * joint_rod_inverse_weight[joint];
+            }
+            if column + 1 < grid_size {
+                let joint = 2 * (row * (grid_size - 1) + column);
+                weighted_residual += residual[joint] * joint_rod_inverse_weight[joint];
+            }
+            if row > 0 {
+                let joint = 2 * (horizontal_rod_count + (row - 1) * grid_size + column) + 1;
+                weighted_residual += residual[joint] * joint_rod_inverse_weight[joint];
+            }
+            if row + 1 < grid_size {
+                let joint = 2 * (horizontal_rod_count + row * grid_size + column);
+                weighted_residual += residual[joint] * joint_rod_inverse_weight[joint];
+            }
+            hub_weighted_residual[row * grid_size + column] = weighted_residual;
+        }
     }
 
     for (index, joint) in joints.iter().enumerate() {
@@ -2449,7 +2466,11 @@ mod tests {
             }
             let expected = simulation.solver_scratch.constraint_residual.clone();
 
-            solve_dual_direct(&simulation.joints, &mut simulation.solver_scratch);
+            solve_dual_direct(
+                &simulation.joints,
+                &mut simulation.solver_scratch,
+                simulation.grid_size,
+            );
 
             let mut actual = vec![DVec3::ZERO; simulation.joints.len()];
             let mut body_forces = vec![[DVec3::ZERO; 4]; simulation.bodies.len()];
@@ -2476,6 +2497,56 @@ mod tests {
                 scene.title()
             );
         }
+    }
+
+    #[test]
+    fn structured_hub_gather_matches_joint_scatter() {
+        let grid_size = GRID_SIZE_OPTIONS[3];
+        let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, grid_size);
+        for body in &mut simulation.bodies {
+            body.predict(1.0 / DEFAULT_FIXED_HZ);
+        }
+        prepare_direct_joint_solver(
+            &simulation.bodies,
+            &simulation.joints,
+            &mut simulation.solver_scratch,
+        );
+        compute_joint_residuals(
+            &simulation.bodies,
+            &simulation.joints,
+            &mut simulation.solver_scratch.constraint_residual,
+            grid_size * grid_size,
+        );
+
+        let mut expected_hub_residual = vec![DVec3::ZERO; grid_size * grid_size];
+        for (index, joint) in simulation.joints.iter().enumerate() {
+            expected_hub_residual[joint.b.body] += simulation.solver_scratch.constraint_residual
+                [index]
+                * simulation.solver_scratch.joint_rod_inverse_weight[index];
+        }
+        let expected_solution = simulation
+            .joints
+            .iter()
+            .enumerate()
+            .map(|(index, joint)| {
+                let hub = joint.b.body;
+                (simulation.solver_scratch.constraint_residual[index]
+                    - expected_hub_residual[hub] * simulation.solver_scratch.hub_schur_factor[hub])
+                    * simulation.solver_scratch.joint_rod_inverse_weight[index]
+            })
+            .collect::<Vec<_>>();
+
+        solve_dual_direct(
+            &simulation.joints,
+            &mut simulation.solver_scratch,
+            grid_size,
+        );
+
+        assert_eq!(
+            simulation.solver_scratch.hub_weighted_residual,
+            expected_hub_residual
+        );
+        assert_eq!(simulation.solver_scratch.solution, expected_solution);
     }
 
     #[test]
