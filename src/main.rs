@@ -524,16 +524,14 @@ impl NetSimulation {
                     );
                 }
                 DemoScene::FallingBalls => {
-                    for _ in 0..CONTACT_PASSES {
-                        project_ball_contacts(
-                            &mut self.bodies,
-                            &self.ball_indices,
-                            &mut self.solver_scratch.contact_proxy_start,
-                            &mut self.solver_scratch.contact_proxy_end,
-                            &mut self.solver_scratch.contact_chunk_min,
-                            &mut self.solver_scratch.contact_chunk_max,
-                        );
-                    }
+                    project_ball_contact_passes(
+                        &mut self.bodies,
+                        &self.ball_indices,
+                        &mut self.solver_scratch.contact_proxy_start,
+                        &mut self.solver_scratch.contact_proxy_end,
+                        &mut self.solver_scratch.contact_chunk_min,
+                        &mut self.solver_scratch.contact_chunk_max,
+                    );
                 }
             }
         }
@@ -1365,6 +1363,38 @@ fn project_cylinder_contacts_reference(bodies: &mut [AffineBody], cylinder: Cyli
     }
 }
 
+fn project_ball_contact_passes(
+    bodies: &mut [AffineBody],
+    ball_indices: &[usize],
+    proxy_start: &mut [DVec3],
+    proxy_end: &mut [DVec3],
+    chunk_min: &mut [DVec3],
+    chunk_max: &mut [DVec3],
+) {
+    for pass in 0..CONTACT_PASSES {
+        project_ball_pairs(bodies, ball_indices);
+        if pass == 0 {
+            rebuild_ball_contact_cache(
+                bodies,
+                ball_indices,
+                proxy_start,
+                proxy_end,
+                chunk_min,
+                chunk_max,
+            );
+        }
+        project_balls_against_cached_net(
+            bodies,
+            ball_indices,
+            proxy_start,
+            proxy_end,
+            chunk_min,
+            chunk_max,
+        );
+    }
+}
+
+#[cfg(test)]
 fn project_ball_contacts(
     bodies: &mut [AffineBody],
     ball_indices: &[usize],
@@ -1373,6 +1403,26 @@ fn project_ball_contacts(
     chunk_min: &mut [DVec3],
     chunk_max: &mut [DVec3],
 ) {
+    project_ball_pairs(bodies, ball_indices);
+    rebuild_ball_contact_cache(
+        bodies,
+        ball_indices,
+        proxy_start,
+        proxy_end,
+        chunk_min,
+        chunk_max,
+    );
+    project_balls_against_cached_net(
+        bodies,
+        ball_indices,
+        proxy_start,
+        proxy_end,
+        chunk_min,
+        chunk_max,
+    );
+}
+
+fn project_ball_pairs(bodies: &mut [AffineBody], ball_indices: &[usize]) {
     for first in 0..ball_indices.len() {
         for second in (first + 1)..ball_indices.len() {
             let a = Attachment {
@@ -1391,7 +1441,16 @@ fn project_ball_contacts(
             project_attachment_pair(bodies, a, b, BALL_RADIUS as f64 * 2.0, fallback);
         }
     }
+}
 
+fn rebuild_ball_contact_cache(
+    bodies: &[AffineBody],
+    ball_indices: &[usize],
+    proxy_start: &mut [DVec3],
+    proxy_end: &mut [DVec3],
+    chunk_min: &mut [DVec3],
+    chunk_max: &mut [DVec3],
+) {
     let net_body_count = ball_indices.first().copied().unwrap_or(bodies.len());
     let chunk_count = net_body_count.div_ceil(CONTACT_PROXY_CHUNK_SIZE);
     for chunk_index in 0..chunk_count {
@@ -1411,7 +1470,18 @@ fn project_ball_contacts(
         chunk_min[chunk_index] = minimum;
         chunk_max[chunk_index] = maximum;
     }
+}
 
+fn project_balls_against_cached_net(
+    bodies: &mut [AffineBody],
+    ball_indices: &[usize],
+    proxy_start: &mut [DVec3],
+    proxy_end: &mut [DVec3],
+    chunk_min: &mut [DVec3],
+    chunk_max: &mut [DVec3],
+) {
+    let net_body_count = ball_indices.first().copied().unwrap_or(bodies.len());
+    let chunk_count = net_body_count.div_ceil(CONTACT_PROXY_CHUNK_SIZE);
     let chunk_margin = BALL_RADIUS as f64 + HUB_RADIUS as f64;
     for &ball_index in ball_indices {
         let ball_center = Attachment {
@@ -2908,6 +2978,54 @@ mod tests {
                 maximum_error < 1.0e-14,
                 "cached contact projection error after {warmup_steps} steps: {maximum_error}"
             );
+        }
+    }
+
+    #[test]
+    fn reused_ball_contact_cache_matches_rebuild_each_pass() {
+        for warmup_steps in [0, 20, 100] {
+            let mut simulation = NetSimulation::new(DemoScene::FallingBalls);
+            for _ in 0..warmup_steps {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let ball_indices = simulation.ball_indices.clone();
+            let mut reused = simulation.bodies.clone();
+            let mut rebuilt = simulation.bodies;
+            let chunk_count = reused.len().div_ceil(CONTACT_PROXY_CHUNK_SIZE);
+            let mut reused_proxy_start = vec![DVec3::ZERO; reused.len()];
+            let mut reused_proxy_end = vec![DVec3::ZERO; reused.len()];
+            let mut reused_chunk_min = vec![DVec3::ZERO; chunk_count];
+            let mut reused_chunk_max = vec![DVec3::ZERO; chunk_count];
+            let mut rebuilt_proxy_start = vec![DVec3::ZERO; rebuilt.len()];
+            let mut rebuilt_proxy_end = vec![DVec3::ZERO; rebuilt.len()];
+            let mut rebuilt_chunk_min = vec![DVec3::ZERO; chunk_count];
+            let mut rebuilt_chunk_max = vec![DVec3::ZERO; chunk_count];
+
+            project_ball_contact_passes(
+                &mut reused,
+                &ball_indices,
+                &mut reused_proxy_start,
+                &mut reused_proxy_end,
+                &mut reused_chunk_min,
+                &mut reused_chunk_max,
+            );
+            for _ in 0..CONTACT_PASSES {
+                project_ball_contacts(
+                    &mut rebuilt,
+                    &ball_indices,
+                    &mut rebuilt_proxy_start,
+                    &mut rebuilt_proxy_end,
+                    &mut rebuilt_chunk_min,
+                    &mut rebuilt_chunk_max,
+                );
+            }
+
+            for (reused, rebuilt) in reused.iter().zip(&rebuilt) {
+                assert_eq!(reused.positions, rebuilt.positions);
+            }
+            assert_eq!(reused_proxy_start, rebuilt_proxy_start);
+            assert_eq!(reused_proxy_end, rebuilt_proxy_end);
         }
     }
 
