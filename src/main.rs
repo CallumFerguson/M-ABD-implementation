@@ -28,6 +28,8 @@ const DEMO_COUNT: usize = 3;
 const PARALLEL_PROJECTION_BODY_THRESHOLD: usize = 4_000;
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_CYLINDER_BODY_THRESHOLD: usize = 4_000;
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_JOINT_THRESHOLD: usize = 15_000;
 const CONTACT_PROXY_CHUNK_SIZE: usize = 32;
 
 const HUB_RADIUS: f32 = 0.075;
@@ -1797,6 +1799,50 @@ fn compute_joint_residuals(
     let rod_count = joints.len() / 2;
     let rods = &bodies[hub_count..hub_count + rod_count];
 
+    #[cfg(not(target_arch = "wasm32"))]
+    if joints.len() >= PARALLEL_JOINT_THRESHOLD
+        && let Some(task_pool) = ComputeTaskPool::try_get()
+    {
+        let task_count = task_pool.thread_num().min(rod_count).max(1);
+        if task_count > 1 {
+            let rods_per_task = rod_count.div_ceil(task_count);
+            task_pool.scope(|scope| {
+                for (task_index, residual_chunk) in
+                    residuals.chunks_mut(rods_per_task * 2).enumerate()
+                {
+                    let first_rod = task_index * rods_per_task;
+                    let end_rod = (first_rod + rods_per_task).min(rod_count);
+                    let rod_chunk = &rods[first_rod..end_rod];
+                    let joint_chunk = &joints[first_rod * 2..end_rod * 2];
+                    scope.spawn(async move {
+                        for ((rod, joint_pair), residual_pair) in rod_chunk
+                            .iter()
+                            .zip(joint_chunk.chunks_exact(2))
+                            .zip(residual_chunk.chunks_exact_mut(2))
+                        {
+                            let positions = &rod.positions;
+                            let start_hub = &bodies[joint_pair[0].b.body].positions;
+                            let end_hub = &bodies[joint_pair[1].b.body].positions;
+                            let start_hub_center = start_hub[0] * 0.25
+                                + start_hub[1] * 0.25
+                                + start_hub[2] * 0.25
+                                + start_hub[3] * 0.25;
+                            let end_hub_center = end_hub[0] * 0.25
+                                + end_hub[1] * 0.25
+                                + end_hub[2] * 0.25
+                                + end_hub[3] * 0.25;
+                            residual_pair[0] =
+                                positions[0] * 0.5 + positions[1] * 0.5 - start_hub_center;
+                            residual_pair[1] =
+                                positions[2] * 0.5 + positions[3] * 0.5 - end_hub_center;
+                        }
+                    });
+                }
+            });
+            return;
+        }
+    }
+
     for ((rod, joint_pair), residual_pair) in rods
         .iter()
         .zip(joints.chunks_exact(2))
@@ -2273,6 +2319,48 @@ mod tests {
         for (parallel, sequential) in simulation.bodies.iter().zip(sequential) {
             assert_eq!(parallel.positions, sequential.positions);
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parallel_joint_residuals_match_sequential_projection() {
+        simulation_task_pool_options().create_default_pools();
+
+        let grid_size = GRID_SIZE_OPTIONS[3];
+        let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, grid_size);
+        for body in &mut simulation.bodies {
+            body.predict(1.0 / DEFAULT_FIXED_HZ);
+        }
+        let mut parallel = vec![DVec3::ZERO; simulation.joints.len()];
+        let mut sequential = vec![DVec3::ZERO; simulation.joints.len()];
+        let hub_count = grid_size * grid_size;
+
+        compute_joint_residuals(
+            &simulation.bodies,
+            &simulation.joints,
+            &mut parallel,
+            hub_count,
+        );
+        let rods = &simulation.bodies[hub_count..hub_count + simulation.joints.len() / 2];
+        for ((rod, joint_pair), residual_pair) in rods
+            .iter()
+            .zip(simulation.joints.chunks_exact(2))
+            .zip(sequential.chunks_exact_mut(2))
+        {
+            let positions = &rod.positions;
+            let start_hub = &simulation.bodies[joint_pair[0].b.body].positions;
+            let end_hub = &simulation.bodies[joint_pair[1].b.body].positions;
+            let start_hub_center = start_hub[0] * 0.25
+                + start_hub[1] * 0.25
+                + start_hub[2] * 0.25
+                + start_hub[3] * 0.25;
+            let end_hub_center =
+                end_hub[0] * 0.25 + end_hub[1] * 0.25 + end_hub[2] * 0.25 + end_hub[3] * 0.25;
+            residual_pair[0] = positions[0] * 0.5 + positions[1] * 0.5 - start_hub_center;
+            residual_pair[1] = positions[2] * 0.5 + positions[3] * 0.5 - end_hub_center;
+        }
+
+        assert_eq!(parallel, sequential);
     }
 
     fn report_step_time(scene: DemoScene) {
