@@ -30,6 +30,8 @@ const PARALLEL_PROJECTION_BODY_THRESHOLD: usize = 4_000;
 const PARALLEL_CYLINDER_BODY_THRESHOLD: usize = 4_000;
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_JOINT_THRESHOLD: usize = 15_000;
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_CORRECTION_JOINT_THRESHOLD: usize = 8_000;
 const CONTACT_PROXY_CHUNK_SIZE: usize = 32;
 
 const HUB_RADIUS: f32 = 0.075;
@@ -2005,7 +2007,116 @@ fn apply_joint_correction(
     grid_size: usize,
 ) {
     debug_assert_eq!(hub_count, grid_size * grid_size);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if joints.len() >= PARALLEL_CORRECTION_JOINT_THRESHOLD
+        && let Some(task_pool) = ComputeTaskPool::try_get()
+    {
+        let thread_count = task_pool.thread_num();
+        if thread_count > 1 {
+            let horizontal_rod_count = grid_size * (grid_size - 1);
+            let hub_task_count = (thread_count / 3).max(1);
+            let rod_task_count = thread_count.saturating_sub(hub_task_count).max(1);
+            let hub_rows_per_task = grid_size.div_ceil(hub_task_count);
+            let rod_count = joints.len() / 2;
+            let rods_per_task = rod_count.div_ceil(rod_task_count);
+            let (hubs, non_hubs) = bodies.split_at_mut(hub_count);
+            let rods = &mut non_hubs[..rod_count];
+            let hub_forces = &mut hub_forces[..hub_count];
+
+            task_pool.scope(|scope| {
+                for (task_index, (hub_chunk, force_chunk)) in hubs
+                    .chunks_mut(hub_rows_per_task * grid_size)
+                    .zip(hub_forces.chunks_mut(hub_rows_per_task * grid_size))
+                    .enumerate()
+                {
+                    let first_row = task_index * hub_rows_per_task;
+                    scope.spawn(async move {
+                        for (row_offset, (hub_row, force_row)) in hub_chunk
+                            .chunks_exact_mut(grid_size)
+                            .zip(force_chunk.chunks_exact_mut(grid_size))
+                            .enumerate()
+                        {
+                            let row = first_row + row_offset;
+                            for (column, (hub, force_slot)) in
+                                hub_row.iter_mut().zip(force_row).enumerate()
+                            {
+                                let mut force = DVec3::ZERO;
+                                if column > 0 {
+                                    let joint = 2 * (row * (grid_size - 1) + column - 1) + 1;
+                                    force += -multipliers[joint] * HUB_CENTER[0];
+                                }
+                                if column + 1 < grid_size {
+                                    let joint = 2 * (row * (grid_size - 1) + column);
+                                    force += -multipliers[joint] * HUB_CENTER[0];
+                                }
+                                if row > 0 {
+                                    let joint = 2
+                                        * (horizontal_rod_count + (row - 1) * grid_size + column)
+                                        + 1;
+                                    force += -multipliers[joint] * HUB_CENTER[0];
+                                }
+                                if row + 1 < grid_size {
+                                    let joint =
+                                        2 * (horizontal_rod_count + row * grid_size + column);
+                                    force += -multipliers[joint] * HUB_CENTER[0];
+                                }
+                                *force_slot = force;
+
+                                if !hub.fixed {
+                                    for position in &mut hub.positions {
+                                        *position -= force * hub.inverse_diagonal;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                for (rod_chunk, multiplier_chunk) in rods
+                    .chunks_mut(rods_per_task)
+                    .zip(multipliers.chunks(rods_per_task * 2))
+                {
+                    scope.spawn(async move {
+                        for (rod, multiplier_pair) in
+                            rod_chunk.iter_mut().zip(multiplier_chunk.chunks_exact(2))
+                        {
+                            let start_correction =
+                                (multiplier_pair[0] * 0.5) * rod.inverse_diagonal;
+                            let end_correction = (multiplier_pair[1] * 0.5) * rod.inverse_diagonal;
+                            rod.positions[0] -= start_correction;
+                            rod.positions[1] -= start_correction;
+                            rod.positions[2] -= end_correction;
+                            rod.positions[3] -= end_correction;
+                        }
+                    });
+                }
+            });
+            return;
+        }
+    }
+
+    apply_joint_correction_sequential(
+        bodies,
+        joints,
+        multipliers,
+        hub_forces,
+        hub_count,
+        grid_size,
+    );
+}
+
+fn apply_joint_correction_sequential(
+    bodies: &mut [AffineBody],
+    joints: &[BallJoint],
+    multipliers: &[DVec3],
+    hub_forces: &mut [DVec3],
+    hub_count: usize,
+    grid_size: usize,
+) {
+    debug_assert_eq!(hub_count, grid_size * grid_size);
     let horizontal_rod_count = grid_size * (grid_size - 1);
+
     for row in 0..grid_size {
         for column in 0..grid_size {
             let mut force = DVec3::ZERO;
@@ -2399,6 +2510,61 @@ mod tests {
         }
 
         assert_eq!(parallel, sequential);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parallel_joint_correction_matches_sequential_correction() {
+        simulation_task_pool_options().create_default_pools();
+
+        let grid_size = GRID_SIZE_OPTIONS[3];
+        let hub_count = grid_size * grid_size;
+        let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, grid_size);
+        for body in &mut simulation.bodies {
+            body.predict(1.0 / DEFAULT_FIXED_HZ);
+        }
+        prepare_direct_joint_solver(
+            &simulation.bodies,
+            &simulation.joints,
+            &mut simulation.solver_scratch,
+        );
+        compute_joint_residuals(
+            &simulation.bodies,
+            &simulation.joints,
+            &mut simulation.solver_scratch.constraint_residual,
+            hub_count,
+        );
+        solve_dual_direct(
+            &simulation.joints,
+            &mut simulation.solver_scratch,
+            grid_size,
+        );
+
+        let mut parallel = simulation.bodies.clone();
+        let mut sequential = simulation.bodies;
+        let mut parallel_hub_forces = vec![DVec3::ZERO; hub_count];
+        let mut sequential_hub_forces = vec![DVec3::ZERO; hub_count];
+        apply_joint_correction(
+            &mut parallel,
+            &simulation.joints,
+            &simulation.solver_scratch.solution,
+            &mut parallel_hub_forces,
+            hub_count,
+            grid_size,
+        );
+        apply_joint_correction_sequential(
+            &mut sequential,
+            &simulation.joints,
+            &simulation.solver_scratch.solution,
+            &mut sequential_hub_forces,
+            hub_count,
+            grid_size,
+        );
+
+        assert_eq!(parallel_hub_forces, sequential_hub_forces);
+        for (parallel, sequential) in parallel.iter().zip(sequential) {
+            assert_eq!(parallel.positions, sequential.positions);
+        }
     }
 
     fn report_step_time(scene: DemoScene) {
