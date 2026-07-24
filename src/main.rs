@@ -410,10 +410,14 @@ struct SolverScratch {
     #[cfg(test)]
     solution: Vec<DVec3>,
     joint_hub: Vec<u32>,
+    #[cfg(test)]
     rod_inverse_weight: Vec<f64>,
+    #[cfg(test)]
     hub_inverse_rod_weight_sum: Vec<f64>,
     hub_weighted_residual: Vec<DVec3>,
+    #[cfg(test)]
     hub_schur_factor: Vec<f64>,
+    hub_delta_scale: Vec<f64>,
     contact_chunk_min: Vec<DVec3>,
     contact_chunk_max: Vec<DVec3>,
 }
@@ -429,10 +433,14 @@ impl SolverScratch {
                 .iter()
                 .map(|joint| u32::try_from(joint.b.body).expect("hub index must fit in u32"))
                 .collect(),
+            #[cfg(test)]
             rod_inverse_weight: vec![0.0; joints.len() / 2],
+            #[cfg(test)]
             hub_inverse_rod_weight_sum: vec![0.0; hub_count],
             hub_weighted_residual: vec![DVec3::ZERO; hub_count],
+            #[cfg(test)]
             hub_schur_factor: vec![0.0; hub_count],
+            hub_delta_scale: vec![0.0; hub_count],
             contact_chunk_min: vec![DVec3::ZERO; body_count.div_ceil(CONTACT_PROXY_CHUNK_SIZE)],
             contact_chunk_max: vec![DVec3::ZERO; body_count.div_ceil(CONTACT_PROXY_CHUNK_SIZE)],
         }
@@ -1983,6 +1991,38 @@ fn prepare_direct_joint_solver(
     joints: &[BallJoint],
     scratch: &mut SolverScratch,
 ) {
+    let inverse_rod_weight = joints
+        .first()
+        .map(|joint| (bodies[joint.a.body].inverse_diagonal * 0.5).recip())
+        .unwrap_or(0.0);
+    #[cfg(debug_assertions)]
+    for joint_pair in joints.chunks_exact(2) {
+        let weight = (bodies[joint_pair[0].a.body].inverse_diagonal * 0.5).recip();
+        debug_assert_eq!(weight.to_bits(), inverse_rod_weight.to_bits());
+    }
+    scratch.hub_delta_scale.fill(0.0);
+
+    for joint_pair in joints.chunks_exact(2) {
+        scratch.hub_delta_scale[joint_pair[0].b.body] += inverse_rod_weight;
+        scratch.hub_delta_scale[joint_pair[1].b.body] += inverse_rod_weight;
+    }
+
+    for (index, scale) in scratch.hub_delta_scale.iter_mut().enumerate() {
+        let coupling = bodies[index].inverse_diagonal * 0.25;
+        let factor = coupling / (1.0 + coupling * *scale);
+        *scale = inverse_rod_weight * factor;
+    }
+
+    #[cfg(test)]
+    prepare_direct_joint_solver_reference(bodies, joints, scratch);
+}
+
+#[cfg(test)]
+fn prepare_direct_joint_solver_reference(
+    bodies: &[AffineBody],
+    joints: &[BallJoint],
+    scratch: &mut SolverScratch,
+) {
     scratch.hub_inverse_rod_weight_sum.fill(0.0);
 
     for (rod, joint_pair) in joints.chunks_exact(2).enumerate() {
@@ -2206,51 +2246,50 @@ fn project_joint_constraints_direct(
     let SolverScratch {
         constraint_residual: endpoint_or_residual,
         joint_hub,
-        rod_inverse_weight,
         hub_weighted_residual: hub_center_or_delta,
-        hub_schur_factor,
+        hub_delta_scale,
         ..
     } = scratch;
     let horizontal_rod_count = grid_size * (grid_size - 1);
     let (hubs, non_hubs) = bodies.split_at_mut(hub_count);
-    let rod_count = rod_inverse_weight.len();
+    let rod_count = endpoint_or_residual.len() / 2;
     let rods = &mut non_hubs[..rod_count];
 
     for row in 0..grid_size {
         for column in 0..grid_size {
             let hub_index = row * grid_size + column;
             let center = hub_center_or_delta[hub_index];
-            let mut weighted_residual = DVec3::ZERO;
+            let mut residual_sum = DVec3::ZERO;
             if column > 0 {
                 let rod = row * (grid_size - 1) + column - 1;
                 let endpoint = 2 * rod + 1;
                 let residual = endpoint_or_residual[endpoint] - center;
                 endpoint_or_residual[endpoint] = residual;
-                weighted_residual += residual * rod_inverse_weight[rod];
+                residual_sum += residual;
             }
             if column + 1 < grid_size {
                 let rod = row * (grid_size - 1) + column;
                 let endpoint = 2 * rod;
                 let residual = endpoint_or_residual[endpoint] - center;
                 endpoint_or_residual[endpoint] = residual;
-                weighted_residual += residual * rod_inverse_weight[rod];
+                residual_sum += residual;
             }
             if row > 0 {
                 let rod = horizontal_rod_count + (row - 1) * grid_size + column;
                 let endpoint = 2 * rod + 1;
                 let residual = endpoint_or_residual[endpoint] - center;
                 endpoint_or_residual[endpoint] = residual;
-                weighted_residual += residual * rod_inverse_weight[rod];
+                residual_sum += residual;
             }
             if row + 1 < grid_size {
                 let rod = horizontal_rod_count + row * grid_size + column;
                 let endpoint = 2 * rod;
                 let residual = endpoint_or_residual[endpoint] - center;
                 endpoint_or_residual[endpoint] = residual;
-                weighted_residual += residual * rod_inverse_weight[rod];
+                residual_sum += residual;
             }
 
-            let delta = weighted_residual * hub_schur_factor[hub_index];
+            let delta = residual_sum * hub_delta_scale[hub_index];
             hub_center_or_delta[hub_index] = delta;
         }
     }
@@ -3326,7 +3365,18 @@ mod tests {
                     .map(|(&weighted_residual, &factor)| weighted_residual * factor)
                     .collect();
                 assert_eq!(cached_scratch.constraint_residual, expected_residual);
-                assert_eq!(cached_scratch.hub_weighted_residual, expected_delta);
+                let maximum_delta_error = cached_scratch
+                    .hub_weighted_residual
+                    .iter()
+                    .zip(&expected_delta)
+                    .map(|(cached, expected)| (*cached - *expected).length())
+                    .fold(0.0_f64, f64::max);
+                assert!(
+                    maximum_delta_error < 1.0e-12,
+                    "{} {grid_size}x{grid_size} uniform-weight hub delta error: \
+                     {maximum_delta_error}",
+                    scene.title()
+                );
 
                 let rod_count = simulation.joints.len() / 2;
                 let (residual_hubs, remaining) = residual_bodies.split_at_mut(hub_count);
@@ -3338,9 +3388,23 @@ mod tests {
                     &residual_scratch.joint_hub,
                     &expected_delta,
                 );
-                for (cached, residual) in cached_bodies.iter().zip(residual_bodies) {
-                    assert_eq!(cached.positions, residual.positions);
-                }
+                let maximum_position_error = cached_bodies
+                    .iter()
+                    .zip(residual_bodies)
+                    .flat_map(|(cached, residual)| {
+                        cached
+                            .positions
+                            .iter()
+                            .zip(residual.positions)
+                            .map(|(cached, residual)| (*cached - residual).length())
+                    })
+                    .fold(0.0_f64, f64::max);
+                assert!(
+                    maximum_position_error < 1.0e-12,
+                    "{} {grid_size}x{grid_size} uniform-weight projection error: \
+                     {maximum_position_error}",
+                    scene.title()
+                );
             }
         }
     }
@@ -3552,6 +3616,48 @@ mod tests {
     }
 
     #[test]
+    fn production_rods_share_one_inverse_weight() {
+        for grid_size in [2, 25, 50, 100] {
+            for scene in [
+                DemoScene::JointGrid,
+                DemoScene::CylinderDrape,
+                DemoScene::FallingBalls,
+            ] {
+                for dt in [1.0 / 30.0, 1.0 / 60.0, 1.0 / 120.0] {
+                    let mut simulation = NetSimulation::with_grid_size(scene, grid_size);
+                    for body in &mut simulation.bodies {
+                        body.update_time_step_coefficients(dt);
+                    }
+                    prepare_direct_joint_solver(
+                        &simulation.bodies,
+                        &simulation.joints,
+                        &mut simulation.solver_scratch,
+                    );
+
+                    let hub_count = grid_size * grid_size;
+                    let rod_count = simulation.joints.len() / 2;
+                    let first_rod_inverse_diagonal = simulation.bodies[hub_count].inverse_diagonal;
+                    for rod in &simulation.bodies[hub_count..hub_count + rod_count] {
+                        assert_eq!(
+                            rod.inverse_diagonal.to_bits(),
+                            first_rod_inverse_diagonal.to_bits()
+                        );
+                    }
+
+                    let inverse_rod_weight = (first_rod_inverse_diagonal * 0.5).recip();
+                    for (hub, &scale) in
+                        simulation.solver_scratch.hub_delta_scale.iter().enumerate()
+                    {
+                        let expected =
+                            inverse_rod_weight * simulation.solver_scratch.hub_schur_factor[hub];
+                        assert_eq!(scale.to_bits(), expected.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn per_rod_inverse_weights_match_per_joint_reference() {
         let grid_size = GRID_SIZE_OPTIONS[1];
         let hub_count = grid_size * grid_size;
@@ -3572,7 +3678,7 @@ mod tests {
             expected_hub_sums[joint.b.body] += inverse_rod_weight;
         }
 
-        prepare_direct_joint_solver(
+        prepare_direct_joint_solver_reference(
             &simulation.bodies,
             &simulation.joints,
             &mut simulation.solver_scratch,
@@ -4296,6 +4402,10 @@ mod tests {
                 assert_eq!(
                     cached.solver_scratch.hub_schur_factor,
                     rebuilt.solver_scratch.hub_schur_factor
+                );
+                assert_eq!(
+                    cached.solver_scratch.hub_delta_scale,
+                    rebuilt.solver_scratch.hub_delta_scale
                 );
                 assert_eq!(
                     cached.previous_velocity_scale.to_bits(),
