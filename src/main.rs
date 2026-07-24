@@ -106,11 +106,11 @@ enum BodyKind {
     Ball,
 }
 
+#[derive(Clone)]
 struct AffineBody {
     kind: BodyKind,
     fixed: bool,
     rest_points: [DVec3; 4],
-    rest_covariance_inverse: DMat3,
     positions: [DVec3; 4],
     previous_positions: [DVec3; 4],
     predicted_positions: [DVec3; 4],
@@ -131,15 +131,11 @@ impl AffineBody {
         fixed: bool,
     ) -> Self {
         let positions = rest_points.map(|point| translation + rotation * point);
-        let rest_covariance = rest_points
-            .iter()
-            .fold(DMat3::ZERO, |sum, point| sum + outer(*point, *point));
 
         Self {
             kind,
             fixed,
             rest_points,
-            rest_covariance_inverse: rest_covariance.inverse(),
             positions,
             previous_positions: positions,
             predicted_positions: positions,
@@ -157,16 +153,9 @@ impl AffineBody {
 
     fn rotation(&self) -> DMat3 {
         match self.kind {
-            BodyKind::Rod => self.rotation_about(self.centroid()),
+            BodyKind::Rod => closest_rotation(rod_deformation_gradient(&self.positions)),
             BodyKind::Hub { .. } | BodyKind::Ball => DMat3::IDENTITY,
         }
-    }
-
-    fn rotation_about(&self, center: DVec3) -> DMat3 {
-        let covariance = (0..4).fold(DMat3::ZERO, |sum, index| {
-            sum + outer(self.positions[index] - center, self.rest_points[index])
-        });
-        closest_rotation(covariance * self.rest_covariance_inverse)
     }
 
     fn predict(&mut self, dt: f64) {
@@ -196,7 +185,7 @@ impl AffineBody {
 
         let center = self.centroid();
         let rotation = match self.kind {
-            BodyKind::Rod => self.rotation_about(center),
+            BodyKind::Rod => closest_rotation(rod_deformation_gradient(&self.positions)),
             BodyKind::Hub { .. } | BodyKind::Ball => DMat3::IDENTITY,
         };
 
@@ -259,7 +248,6 @@ struct NetSimulation {
 struct SolverScratch {
     constraint_residual: Vec<DVec3>,
     solution: Vec<DVec3>,
-    body_forces: Vec<[DVec3; 4]>,
     joint_rod_inverse_weight: Vec<f64>,
     hub_coupling: Vec<f64>,
     hub_inverse_rod_weight_sum: Vec<f64>,
@@ -272,7 +260,6 @@ impl SolverScratch {
         Self {
             constraint_residual: vec![DVec3::ZERO; joint_count],
             solution: vec![DVec3::ZERO; joint_count],
-            body_forces: vec![[DVec3::ZERO; 4]; body_count],
             joint_rod_inverse_weight: vec![0.0; joint_count],
             hub_coupling: vec![0.0; body_count],
             hub_inverse_rod_weight_sum: vec![0.0; body_count],
@@ -439,7 +426,7 @@ impl NetSimulation {
                 &mut self.bodies,
                 &self.joints,
                 &self.solver_scratch.solution,
-                &mut self.solver_scratch.body_forces,
+                &mut self.solver_scratch.hub_weighted_residual,
             );
 
             for _ in 0..CONTACT_PASSES {
@@ -1128,11 +1115,13 @@ fn project_attachment_against_cylinder(
 ) {
     let position = attachment_position(bodies, attachment);
     let radial = reject_from_axis(position - cylinder_origin, cylinder_axis);
-    let distance = radial.length();
-    let penetration = cylinder_radius + proxy_radius - distance;
-    if penetration <= 0.0 {
+    let contact_distance = cylinder_radius + proxy_radius;
+    let distance_squared = radial.length_squared();
+    if distance_squared >= contact_distance * contact_distance {
         return;
     }
+    let distance = distance_squared.sqrt();
+    let penetration = contact_distance - distance;
 
     let previous = previous_attachment_position(bodies, attachment);
     let previous_radial = reject_from_axis(previous - cylinder_origin, cylinder_axis);
@@ -1220,11 +1209,12 @@ fn project_attachment_pair(
     }
 
     let delta = attachment_position(bodies, a) - attachment_position(bodies, b);
-    let distance = delta.length();
-    let penetration = minimum_distance - distance;
-    if penetration <= 0.0 {
+    let distance_squared = delta.length_squared();
+    if distance_squared >= minimum_distance * minimum_distance {
         return;
     }
+    let distance = distance_squared.sqrt();
+    let penetration = minimum_distance - distance;
 
     let previous_delta =
         previous_attachment_position(bodies, a) - previous_attachment_position(bodies, b);
@@ -1449,9 +1439,36 @@ fn apply_joint_correction(
     bodies: &mut [AffineBody],
     joints: &[BallJoint],
     multipliers: &[DVec3],
-    body_forces: &mut [[DVec3; 4]],
+    hub_forces: &mut [DVec3],
 ) {
-    body_forces.fill([DVec3::ZERO; 4]);
+    hub_forces.fill(DVec3::ZERO);
+
+    for (joint, multiplier) in joints.iter().zip(multipliers) {
+        let rod = &mut bodies[joint.a.body];
+        for (position, weight) in rod.positions.iter_mut().zip(joint.a.weights) {
+            let force = *multiplier * weight;
+            *position -= force * rod.inverse_diagonal;
+        }
+        hub_forces[joint.b.body] += -*multiplier * HUB_CENTER[0];
+    }
+
+    for (body, force) in bodies.iter_mut().zip(hub_forces.iter()) {
+        if body.fixed || !matches!(body.kind, BodyKind::Hub { .. }) {
+            continue;
+        }
+        for position in &mut body.positions {
+            *position -= *force * body.inverse_diagonal;
+        }
+    }
+}
+
+#[cfg(test)]
+fn apply_joint_correction_generic(
+    bodies: &mut [AffineBody],
+    joints: &[BallJoint],
+    multipliers: &[DVec3],
+) {
+    let mut body_forces = vec![[DVec3::ZERO; 4]; bodies.len()];
 
     for (joint, multiplier) in joints.iter().zip(multipliers) {
         accumulate_attachment(&mut body_forces[joint.a.body], joint.a.weights, *multiplier);
@@ -1535,8 +1552,15 @@ fn centroid(points: &[DVec3; 4]) -> DVec3 {
     (points[0] + points[1] + points[2] + points[3]) * 0.25
 }
 
-fn outer(a: DVec3, b: DVec3) -> DMat3 {
-    DMat3::from_cols(a * b.x, a * b.y, a * b.z)
+fn rod_deformation_gradient(points: &[DVec3; 4]) -> DMat3 {
+    let inverse_four_half_length = 1.0 / (2.0 * GRID_SPACING);
+    let inverse_four_radius = 1.0 / (2.0 * ROD_THICKNESS as f64);
+
+    DMat3::from_cols(
+        (-points[0] - points[1] + points[2] + points[3]) * inverse_four_half_length,
+        (-points[0] + points[1] - points[2] + points[3]) * inverse_four_radius,
+        (-points[0] + points[1] + points[2] - points[3]) * inverse_four_radius,
+    )
 }
 
 fn closest_rotation(matrix: DMat3) -> DMat3 {
@@ -1689,6 +1713,53 @@ mod tests {
     }
 
     #[test]
+    fn specialized_joint_correction_matches_generic_scatter() {
+        for scene in [DemoScene::JointGrid, DemoScene::FallingBalls] {
+            let mut simulation = NetSimulation::new(scene);
+            for body in &mut simulation.bodies {
+                body.predict(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let multipliers = (0..simulation.joints.len())
+                .map(|index| {
+                    let x = ((index * 13) % 19) as f64 - 9.0;
+                    let y = ((index * 23) % 31) as f64 - 15.0;
+                    let z = ((index * 37) % 41) as f64 - 20.0;
+                    DVec3::new(x, y, z) * 0.001
+                })
+                .collect::<Vec<_>>();
+            let mut specialized = simulation.bodies.clone();
+            let mut generic = simulation.bodies;
+
+            let mut hub_forces = vec![DVec3::ZERO; specialized.len()];
+            apply_joint_correction(
+                &mut specialized,
+                &simulation.joints,
+                &multipliers,
+                &mut hub_forces,
+            );
+            apply_joint_correction_generic(&mut generic, &simulation.joints, &multipliers);
+
+            let maximum_error = specialized
+                .iter()
+                .zip(&generic)
+                .flat_map(|(specialized, generic)| {
+                    specialized
+                        .positions
+                        .iter()
+                        .zip(&generic.positions)
+                        .map(|(specialized, generic)| (*specialized - *generic).length())
+                })
+                .fold(0.0_f64, f64::max);
+            assert!(
+                maximum_error < 1.0e-15,
+                "{} specialized correction error: {maximum_error}",
+                scene.title()
+            );
+        }
+    }
+
+    #[test]
     fn center_attached_bodies_remain_unrotated() {
         for scene in [
             DemoScene::JointGrid,
@@ -1724,6 +1795,53 @@ mod tests {
             assert!(
                 maximum_velocity_spread < 1.0e-10,
                 "{} center-attached velocity spread: {maximum_velocity_spread}",
+                scene.title()
+            );
+        }
+    }
+
+    #[test]
+    fn rod_deformation_gradient_matches_generic_affine_form() {
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut simulation = NetSimulation::new(scene);
+            for _ in 0..20 {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let mut maximum_error = 0.0_f64;
+            for body in &simulation.bodies {
+                if !matches!(body.kind, BodyKind::Rod) {
+                    continue;
+                }
+
+                let center = body.centroid();
+                let covariance = (0..4).fold(DMat3::ZERO, |sum, index| {
+                    let position = body.positions[index] - center;
+                    let rest = body.rest_points[index];
+                    sum + DMat3::from_cols(position * rest.x, position * rest.y, position * rest.z)
+                });
+                let rest_covariance = body.rest_points.iter().fold(DMat3::ZERO, |sum, rest| {
+                    sum + DMat3::from_cols(*rest * rest.x, *rest * rest.y, *rest * rest.z)
+                });
+                let expected = covariance * rest_covariance.inverse();
+                let actual = rod_deformation_gradient(&body.positions);
+                maximum_error = maximum_error.max(
+                    actual
+                        .to_cols_array()
+                        .into_iter()
+                        .zip(expected.to_cols_array())
+                        .map(|(actual, expected)| (actual - expected).abs())
+                        .fold(0.0_f64, f64::max),
+                );
+            }
+
+            assert!(
+                maximum_error < 1.0e-11,
+                "{} specialized rod gradient error: {maximum_error}",
                 scene.title()
             );
         }
