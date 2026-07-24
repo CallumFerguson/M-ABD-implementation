@@ -204,19 +204,31 @@ impl AffineBody {
     fn project_corotated_shape_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self) {
         match self.kind {
             BodyKind::Hub { .. } => self.project_hub_shape(),
-            BodyKind::Rod => self.project_rod_shape::<POLAR_ITERATIONS>(),
+            BodyKind::Rod => self.project_rod_shape::<POLAR_ITERATIONS, true>(),
             BodyKind::Ball => self.project_ball_shape(),
         }
     }
 
     #[inline]
-    fn project_rod_shape<const POLAR_ITERATIONS: usize>(&mut self) {
+    fn project_rod_shape<const POLAR_ITERATIONS: usize, const DIVISION_FREE_FINAL: bool>(
+        &mut self,
+    ) {
         let center = self.centroid();
         let prediction_weight = self.inertia * self.inverse_diagonal;
         let shape_weight = AFFINE_STIFFNESS * self.inverse_diagonal;
-        let rotation = closest_rotation_with_iterations::<POLAR_ITERATIONS>(
-            rod_deformation_gradient(&self.positions),
-        );
+        let gradient = rod_deformation_gradient(&self.positions);
+        let rotation = if DIVISION_FREE_FINAL {
+            closest_rotation_with_iterations::<POLAR_ITERATIONS>(gradient)
+        } else {
+            #[cfg(test)]
+            {
+                closest_rotation_with_divisive_final::<POLAR_ITERATIONS>(gradient)
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("the divisive final polar round is test-only")
+            }
+        };
         let half_length = GRID_SPACING * 0.5;
         let radius = ROD_THICKNESS as f64 * 0.5;
         let x = rotation.x_axis * half_length;
@@ -281,7 +293,7 @@ impl AffineBody {
     }
 }
 
-fn project_corotated_shapes<const POLAR_ITERATIONS: usize>(
+fn project_corotated_shapes<const POLAR_ITERATIONS: usize, const DIVISION_FREE_FINAL: bool>(
     bodies: &mut [AffineBody],
     grid_size: usize,
     projected_hub_center: &mut [DVec3],
@@ -316,7 +328,7 @@ fn project_corotated_shapes<const POLAR_ITERATIONS: usize>(
                         for (body, endpoints) in
                             chunk.iter_mut().zip(endpoint_chunk.chunks_exact_mut(2))
                         {
-                            body.project_rod_shape::<POLAR_ITERATIONS>();
+                            body.project_rod_shape::<POLAR_ITERATIONS, DIVISION_FREE_FINAL>();
                             endpoints.copy_from_slice(&rod_joint_endpoints(&body.positions));
                         }
                     });
@@ -348,7 +360,7 @@ fn project_corotated_shapes<const POLAR_ITERATIONS: usize>(
         .iter_mut()
         .zip(projected_rod_endpoints.chunks_exact_mut(2))
     {
-        rod.project_rod_shape::<POLAR_ITERATIONS>();
+        rod.project_rod_shape::<POLAR_ITERATIONS, DIVISION_FREE_FINAL>();
         endpoints.copy_from_slice(&rod_joint_endpoints(&rod.positions));
     }
     for ball in balls {
@@ -563,15 +575,24 @@ impl NetSimulation {
     }
 
     fn step_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self, dt: f64) {
-        self.step_with_joint_projection::<POLAR_ITERATIONS, true>(dt);
+        self.step_with_joint_projection::<POLAR_ITERATIONS, true, true>(dt);
     }
 
     #[cfg(test)]
     fn step_with_dual_projection(&mut self, dt: f64) {
-        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, false>(dt);
+        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, false, true>(dt);
     }
 
-    fn step_with_joint_projection<const POLAR_ITERATIONS: usize, const DIRECT: bool>(
+    #[cfg(test)]
+    fn step_with_divisive_final_polar_round(&mut self, dt: f64) {
+        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, true, false>(dt);
+    }
+
+    fn step_with_joint_projection<
+        const POLAR_ITERATIONS: usize,
+        const DIRECT: bool,
+        const DIVISION_FREE_FINAL: bool,
+    >(
         &mut self,
         dt: f64,
     ) {
@@ -591,7 +612,7 @@ impl NetSimulation {
         }
 
         for _ in 0..COROTATED_ITERATIONS {
-            project_corotated_shapes::<POLAR_ITERATIONS>(
+            project_corotated_shapes::<POLAR_ITERATIONS, DIVISION_FREE_FINAL>(
                 &mut self.bodies,
                 self.grid_size,
                 &mut self.solver_scratch.hub_weighted_residual,
@@ -2646,14 +2667,44 @@ fn closest_rotation(matrix: DMat3) -> DMat3 {
 
 fn closest_rotation_with_iterations<const ITERATIONS: usize>(matrix: DMat3) -> DMat3 {
     let mut rotation = matrix;
+    let mut final_round_pending = true;
 
-    for _ in 0..ITERATIONS {
+    for _ in 1..ITERATIONS {
         if rotation.determinant().abs() <= 1.0e-12 {
+            final_round_pending = false;
             break;
         }
         rotation = (rotation + rotation.inverse().transpose()) * 0.5;
     }
 
+    if ITERATIONS > 0 && final_round_pending {
+        let cofactor_z = rotation.x_axis.cross(rotation.y_axis);
+        let determinant = rotation.z_axis.dot(cofactor_z);
+        if determinant.abs() > 1.0e-12 {
+            let cofactor_x = rotation.y_axis.cross(rotation.z_axis);
+            let cofactor_y = rotation.z_axis.cross(rotation.x_axis);
+            let scale = determinant.abs();
+            rotation = if determinant > 0.0 {
+                DMat3::from_cols(
+                    rotation.x_axis * scale + cofactor_x,
+                    rotation.y_axis * scale + cofactor_y,
+                    rotation.z_axis * scale + cofactor_z,
+                )
+            } else {
+                DMat3::from_cols(
+                    rotation.x_axis * scale - cofactor_x,
+                    rotation.y_axis * scale - cofactor_y,
+                    rotation.z_axis * scale - cofactor_z,
+                )
+            };
+        }
+    }
+
+    orthonormalize_rotation(rotation)
+}
+
+#[inline]
+fn orthonormalize_rotation(rotation: DMat3) -> DMat3 {
     let Some(x) = rotation.x_axis.try_normalize() else {
         return DMat3::IDENTITY;
     };
@@ -2668,6 +2719,20 @@ fn closest_rotation_with_iterations<const ITERATIONS: usize>(matrix: DMat3) -> D
     y = z.cross(x);
 
     DMat3::from_cols(x, y, z)
+}
+
+#[cfg(test)]
+fn closest_rotation_with_divisive_final<const ITERATIONS: usize>(matrix: DMat3) -> DMat3 {
+    let mut rotation = matrix;
+
+    for _ in 0..ITERATIONS {
+        if rotation.determinant().abs() <= 1.0e-12 {
+            break;
+        }
+        rotation = (rotation + rotation.inverse().transpose()) * 0.5;
+    }
+
+    orthonormalize_rotation(rotation)
 }
 
 #[cfg(test)]
@@ -2779,6 +2844,151 @@ mod tests {
             maximum_orthonormality_error < 2.0e-14,
             "optimized rotation orthonormality error: {maximum_orthonormality_error}"
         );
+    }
+
+    #[test]
+    fn division_free_final_polar_round_matches_divisive_reference() {
+        fn component_error(actual: DMat3, expected: DMat3) -> f64 {
+            actual
+                .to_cols_array()
+                .into_iter()
+                .zip(expected.to_cols_array())
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0_f64, f64::max)
+        }
+
+        fn compare_corpus<const ITERATIONS: usize>(matrices: &[DMat3]) -> f64 {
+            matrices.iter().fold(0.0_f64, |maximum, &matrix| {
+                maximum.max(component_error(
+                    closest_rotation_with_iterations::<ITERATIONS>(matrix),
+                    closest_rotation_with_divisive_final::<ITERATIONS>(matrix),
+                ))
+            })
+        }
+
+        let rotation = DMat3::from_quat(
+            DQuat::from_rotation_x(0.37)
+                * DQuat::from_rotation_y(-0.61)
+                * DQuat::from_rotation_z(0.19),
+        );
+        let corpus = [
+            DMat3::IDENTITY,
+            DMat3::from_diagonal(DVec3::new(0.35, 1.7, 3.2)),
+            rotation * DMat3::from_diagonal(DVec3::new(0.6, 1.4, 2.1)),
+            DMat3::from_cols(
+                DVec3::new(1.0, 0.2, -0.1),
+                DVec3::new(0.35, 0.9, 0.15),
+                DVec3::new(-0.2, 0.1, 1.3),
+            ),
+            DMat3::from_diagonal(DVec3::new(-1.0, 1.0, 1.0)),
+            DMat3::ZERO,
+            DMat3::from_diagonal(DVec3::new(1.0e-14, 1.0, 1.0)),
+            DMat3::from_diagonal(DVec3::splat(1.0e100)),
+        ];
+        let corpus_error = compare_corpus::<1>(&corpus)
+            .max(compare_corpus::<2>(&corpus))
+            .max(compare_corpus::<3>(&corpus));
+
+        for matrix in &corpus[5..] {
+            assert_eq!(
+                closest_rotation_with_iterations::<2>(*matrix),
+                closest_rotation_with_divisive_final::<2>(*matrix)
+            );
+        }
+
+        let mut maximum_live_error = 0.0_f64;
+        let mut maximum_orthonormality_error = 0.0_f64;
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut simulation = NetSimulation::new(scene);
+            for step in 0..=150 {
+                if matches!(step, 0 | 20 | 150) {
+                    for body in &simulation.bodies {
+                        if !matches!(body.kind, BodyKind::Rod) {
+                            continue;
+                        }
+                        let gradient = rod_deformation_gradient(&body.positions);
+                        let optimized = closest_rotation(gradient);
+                        let divisive = closest_rotation_with_divisive_final::<
+                            POLAR_NEWTON_ITERATIONS,
+                        >(gradient);
+                        maximum_live_error =
+                            maximum_live_error.max(component_error(optimized, divisive));
+                        maximum_orthonormality_error = maximum_orthonormality_error.max(
+                            (optimized.transpose() * optimized - DMat3::IDENTITY)
+                                .to_cols_array()
+                                .into_iter()
+                                .map(f64::abs)
+                                .fold(0.0_f64, f64::max),
+                        );
+                    }
+                }
+                if step < 150 {
+                    simulation.step(1.0 / DEFAULT_FIXED_HZ);
+                }
+            }
+        }
+
+        assert!(
+            corpus_error < 1.0e-12,
+            "division-free polar corpus error: {corpus_error}"
+        );
+        assert!(
+            maximum_live_error < 5.0e-14,
+            "division-free polar live error: {maximum_live_error}"
+        );
+        assert!(
+            maximum_orthonormality_error < 2.0e-14,
+            "division-free polar orthonormality error: {maximum_orthonormality_error}"
+        );
+    }
+
+    #[test]
+    fn division_free_final_polar_round_preserves_trajectory() {
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut optimized = NetSimulation::new(scene);
+            let mut reference = NetSimulation::new(scene);
+            for _ in 0..150 {
+                optimized.step(1.0 / DEFAULT_FIXED_HZ);
+                reference.step_with_divisive_final_polar_round(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let mut squared_error_sum = 0.0;
+            let mut point_count = 0;
+            let mut maximum_error = 0.0_f64;
+            for (optimized_body, reference_body) in optimized.bodies.iter().zip(&reference.bodies) {
+                for (optimized_point, reference_point) in optimized_body
+                    .positions
+                    .iter()
+                    .zip(reference_body.positions)
+                {
+                    let error = (*optimized_point - reference_point).length();
+                    squared_error_sum += error * error;
+                    point_count += 1;
+                    maximum_error = maximum_error.max(error);
+                }
+            }
+            let rms_error = (squared_error_sum / point_count as f64).sqrt();
+            assert!(simulation_is_finite(&optimized));
+            assert!(simulation_is_finite(&reference));
+            assert!(
+                rms_error < 1.0e-9,
+                "{} division-free polar RMS trajectory error: {rms_error}",
+                scene.title()
+            );
+            assert!(
+                maximum_error < 1.0e-8,
+                "{} division-free polar maximum trajectory error: {maximum_error}",
+                scene.title()
+            );
+        }
     }
 
     #[test]
@@ -2918,7 +3128,7 @@ mod tests {
             let mut hub_centers = vec![DVec3::ZERO; hub_count];
             let mut rod_endpoints = vec![DVec3::ZERO; rod_count * 2];
 
-            project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(
+            project_corotated_shapes::<POLAR_NEWTON_ITERATIONS, true>(
                 &mut simulation.bodies,
                 simulation.grid_size,
                 &mut hub_centers,
@@ -3056,13 +3266,13 @@ mod tests {
                     SolverScratch::new(cached_bodies.len(), &simulation.joints, hub_count);
                 let mut residual_scratch =
                     SolverScratch::new(residual_bodies.len(), &simulation.joints, hub_count);
-                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(
+                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS, true>(
                     &mut cached_bodies,
                     grid_size,
                     &mut cached_scratch.hub_weighted_residual,
                     &mut cached_scratch.constraint_residual,
                 );
-                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(
+                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS, true>(
                     &mut residual_bodies,
                     grid_size,
                     &mut residual_scratch.hub_weighted_residual,
