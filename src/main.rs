@@ -389,6 +389,7 @@ struct NetSimulation {
 
 struct SolverScratch {
     constraint_residual: Vec<DVec3>,
+    #[cfg(test)]
     solution: Vec<DVec3>,
     joint_hub: Vec<u32>,
     rod_inverse_weight: Vec<f64>,
@@ -406,6 +407,7 @@ impl SolverScratch {
         debug_assert_eq!(joints.len() % 2, 0);
         Self {
             constraint_residual: vec![DVec3::ZERO; joints.len()],
+            #[cfg(test)]
             solution: vec![DVec3::ZERO; joints.len()],
             joint_hub: joints
                 .iter()
@@ -558,6 +560,18 @@ impl NetSimulation {
     }
 
     fn step_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self, dt: f64) {
+        self.step_with_joint_projection::<POLAR_ITERATIONS, true>(dt);
+    }
+
+    #[cfg(test)]
+    fn step_with_dual_projection(&mut self, dt: f64) {
+        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, false>(dt);
+    }
+
+    fn step_with_joint_projection<const POLAR_ITERATIONS: usize, const DIRECT: bool>(
+        &mut self,
+        dt: f64,
+    ) {
         let dt_bits = dt.to_bits();
         if self.coefficient_dt_bits != dt_bits {
             for body in &mut self.bodies {
@@ -581,15 +595,29 @@ impl NetSimulation {
                 self.grid_size * self.grid_size,
             );
 
-            solve_dual_direct(&mut self.solver_scratch, self.grid_size);
-            apply_joint_correction(
-                &mut self.bodies,
-                &self.joints,
-                &self.solver_scratch.solution,
-                &mut self.solver_scratch.hub_weighted_residual,
-                self.grid_size * self.grid_size,
-                self.grid_size,
-            );
+            if DIRECT {
+                project_joint_constraints_direct(
+                    &mut self.bodies,
+                    &mut self.solver_scratch,
+                    self.grid_size * self.grid_size,
+                    self.grid_size,
+                );
+            } else {
+                #[cfg(test)]
+                {
+                    solve_dual_direct(&mut self.solver_scratch, self.grid_size);
+                    apply_joint_correction(
+                        &mut self.bodies,
+                        &self.joints,
+                        &self.solver_scratch.solution,
+                        &mut self.solver_scratch.hub_weighted_residual,
+                        self.grid_size * self.grid_size,
+                        self.grid_size,
+                    );
+                }
+                #[cfg(not(test))]
+                unreachable!("the legacy dual projection is test-only");
+            }
 
             match self.scene {
                 DemoScene::JointGrid => {}
@@ -2080,6 +2108,7 @@ fn debug_validate_direct_solver_topology(bodies: &[AffineBody], joints: &[BallJo
 #[cfg(not(debug_assertions))]
 fn debug_validate_direct_solver_topology(_bodies: &[AffineBody], _joints: &[BallJoint]) {}
 
+#[cfg(test)]
 fn solve_dual_direct(scratch: &mut SolverScratch, grid_size: usize) {
     let SolverScratch {
         constraint_residual: residual,
@@ -2133,6 +2162,130 @@ fn solve_dual_direct(scratch: &mut SolverScratch, grid_size: usize) {
     }
 }
 
+fn project_joint_constraints_direct(
+    bodies: &mut [AffineBody],
+    scratch: &mut SolverScratch,
+    hub_count: usize,
+    grid_size: usize,
+) {
+    debug_assert_eq!(hub_count, grid_size * grid_size);
+    let SolverScratch {
+        constraint_residual,
+        joint_hub,
+        rod_inverse_weight,
+        hub_weighted_residual: hub_delta,
+        hub_schur_factor,
+        ..
+    } = scratch;
+    let horizontal_rod_count = grid_size * (grid_size - 1);
+    let (hubs, non_hubs) = bodies.split_at_mut(hub_count);
+    let rod_count = rod_inverse_weight.len();
+    let rods = &mut non_hubs[..rod_count];
+
+    for row in 0..grid_size {
+        for column in 0..grid_size {
+            let mut weighted_residual = DVec3::ZERO;
+            if column > 0 {
+                let rod = row * (grid_size - 1) + column - 1;
+                weighted_residual += constraint_residual[2 * rod + 1] * rod_inverse_weight[rod];
+            }
+            if column + 1 < grid_size {
+                let rod = row * (grid_size - 1) + column;
+                weighted_residual += constraint_residual[2 * rod] * rod_inverse_weight[rod];
+            }
+            if row > 0 {
+                let rod = horizontal_rod_count + (row - 1) * grid_size + column;
+                weighted_residual += constraint_residual[2 * rod + 1] * rod_inverse_weight[rod];
+            }
+            if row + 1 < grid_size {
+                let rod = horizontal_rod_count + row * grid_size + column;
+                weighted_residual += constraint_residual[2 * rod] * rod_inverse_weight[rod];
+            }
+
+            let hub_index = row * grid_size + column;
+            let delta = weighted_residual * hub_schur_factor[hub_index];
+            hub_delta[hub_index] = delta;
+        }
+    }
+
+    let constraint_residual = constraint_residual.as_slice();
+    let joint_hub = joint_hub.as_slice();
+    let hub_delta = hub_delta.as_slice();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if constraint_residual.len() >= PARALLEL_CORRECTION_JOINT_THRESHOLD
+        && let Some(task_pool) = ComputeTaskPool::try_get()
+    {
+        let thread_count = task_pool.thread_num();
+        if thread_count > 1 {
+            let hub_task_count = (thread_count / 3).max(1);
+            let rod_task_count = thread_count.saturating_sub(hub_task_count).max(1);
+            let hubs_per_task = hub_count.div_ceil(hub_task_count);
+            let rods_per_task = rod_count.div_ceil(rod_task_count);
+            task_pool.scope(|scope| {
+                for (task_index, rod_chunk) in rods.chunks_mut(rods_per_task).enumerate() {
+                    let first_rod = task_index * rods_per_task;
+                    let end_rod = (first_rod + rods_per_task).min(rod_count);
+                    let residual_chunk = &constraint_residual[first_rod * 2..end_rod * 2];
+                    let hub_chunk = &joint_hub[first_rod * 2..end_rod * 2];
+                    scope.spawn(async move {
+                        project_rod_joint_constraints(
+                            rod_chunk,
+                            residual_chunk,
+                            hub_chunk,
+                            hub_delta,
+                        );
+                    });
+                }
+                for (hub_chunk, delta_chunk) in hubs
+                    .chunks_mut(hubs_per_task)
+                    .zip(hub_delta.chunks(hubs_per_task))
+                {
+                    scope.spawn(async move {
+                        apply_hub_joint_deltas(hub_chunk, delta_chunk);
+                    });
+                }
+            });
+            return;
+        }
+    }
+
+    apply_hub_joint_deltas(hubs, hub_delta);
+    project_rod_joint_constraints(rods, constraint_residual, joint_hub, hub_delta);
+}
+
+#[inline]
+fn apply_hub_joint_deltas(hubs: &mut [AffineBody], hub_delta: &[DVec3]) {
+    for (hub, &delta) in hubs.iter_mut().zip(hub_delta) {
+        if !hub.fixed {
+            for position in &mut hub.positions {
+                *position += delta;
+            }
+        }
+    }
+}
+
+#[inline]
+fn project_rod_joint_constraints(
+    rods: &mut [AffineBody],
+    residuals: &[DVec3],
+    joint_hubs: &[u32],
+    hub_delta: &[DVec3],
+) {
+    for ((rod, residual_pair), hub_pair) in rods
+        .iter_mut()
+        .zip(residuals.chunks_exact(2))
+        .zip(joint_hubs.chunks_exact(2))
+    {
+        let start_correction = residual_pair[0] - hub_delta[hub_pair[0] as usize];
+        let end_correction = residual_pair[1] - hub_delta[hub_pair[1] as usize];
+        rod.positions[0] -= start_correction;
+        rod.positions[1] -= start_correction;
+        rod.positions[2] -= end_correction;
+        rod.positions[3] -= end_correction;
+    }
+}
+
 #[cfg(test)]
 fn apply_dual_matrix(
     bodies: &[AffineBody],
@@ -2164,6 +2317,7 @@ fn apply_dual_matrix(
     }
 }
 
+#[cfg(test)]
 fn apply_joint_correction(
     bodies: &mut [AffineBody],
     joints: &[BallJoint],
@@ -2272,6 +2426,7 @@ fn apply_joint_correction(
     );
 }
 
+#[cfg(test)]
 fn apply_joint_correction_sequential(
     bodies: &mut [AffineBody],
     joints: &[BallJoint],
@@ -2732,6 +2887,127 @@ mod tests {
         assert_eq!(parallel_hub_forces, sequential_hub_forces);
         for (parallel, sequential) in parallel.iter().zip(sequential) {
             assert_eq!(parallel.positions, sequential.positions);
+        }
+    }
+
+    #[test]
+    fn direct_joint_projection_matches_dual_projection() {
+        #[cfg(not(target_arch = "wasm32"))]
+        simulation_task_pool_options().create_default_pools();
+
+        for grid_size in GRID_SIZE_OPTIONS {
+            for scene in [
+                DemoScene::JointGrid,
+                DemoScene::CylinderDrape,
+                DemoScene::FallingBalls,
+            ] {
+                let mut simulation = NetSimulation::with_grid_size(scene, grid_size);
+                for _ in 0..20 {
+                    simulation.step(1.0 / DEFAULT_FIXED_HZ);
+                }
+
+                let hub_count = grid_size * grid_size;
+                let mut direct_bodies = simulation.bodies.clone();
+                let mut dual_bodies = simulation.bodies.clone();
+                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(&mut direct_bodies, grid_size);
+                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(&mut dual_bodies, grid_size);
+
+                let mut direct_scratch =
+                    SolverScratch::new(direct_bodies.len(), &simulation.joints, hub_count);
+                let mut dual_scratch =
+                    SolverScratch::new(dual_bodies.len(), &simulation.joints, hub_count);
+                prepare_direct_joint_solver(
+                    &direct_bodies,
+                    &simulation.joints,
+                    &mut direct_scratch,
+                );
+                prepare_direct_joint_solver(&dual_bodies, &simulation.joints, &mut dual_scratch);
+                compute_joint_residuals(
+                    &direct_bodies,
+                    &simulation.joints,
+                    &mut direct_scratch.constraint_residual,
+                    hub_count,
+                );
+                compute_joint_residuals(
+                    &dual_bodies,
+                    &simulation.joints,
+                    &mut dual_scratch.constraint_residual,
+                    hub_count,
+                );
+
+                project_joint_constraints_direct(
+                    &mut direct_bodies,
+                    &mut direct_scratch,
+                    hub_count,
+                    grid_size,
+                );
+                solve_dual_direct(&mut dual_scratch, grid_size);
+                apply_joint_correction(
+                    &mut dual_bodies,
+                    &simulation.joints,
+                    &dual_scratch.solution,
+                    &mut dual_scratch.hub_weighted_residual,
+                    hub_count,
+                    grid_size,
+                );
+
+                let maximum_error = direct_bodies
+                    .iter()
+                    .zip(&dual_bodies)
+                    .flat_map(|(direct, dual)| direct.positions.iter().zip(dual.positions))
+                    .map(|(direct, dual)| (*direct - dual).length())
+                    .fold(0.0_f64, f64::max);
+                assert!(
+                    maximum_error < 2.0e-12,
+                    "{} {grid_size}x{grid_size} direct-vs-dual projection error: {maximum_error}",
+                    scene.title()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_joint_projection_preserves_dual_trajectory() {
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut direct = NetSimulation::new(scene);
+            let mut dual = NetSimulation::new(scene);
+            for _ in 0..150 {
+                direct.step(1.0 / DEFAULT_FIXED_HZ);
+                dual.step_with_dual_projection(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let mut squared_error_sum = 0.0;
+            let mut point_count = 0;
+            let mut maximum_error = 0.0_f64;
+            for (direct_body, dual_body) in direct.bodies.iter().zip(&dual.bodies) {
+                for (direct_point, dual_point) in
+                    direct_body.positions.iter().zip(dual_body.positions)
+                {
+                    let error = (*direct_point - dual_point).length();
+                    squared_error_sum += error * error;
+                    point_count += 1;
+                    maximum_error = maximum_error.max(error);
+                }
+            }
+            let rms_error = (squared_error_sum / point_count as f64).sqrt();
+            println!(
+                "DIRECT_PROJECTION_ERROR scene={} rms={rms_error:.3e} max={maximum_error:.3e}",
+                scene.number()
+            );
+            assert!(
+                rms_error < 1.0e-9,
+                "{} direct-vs-dual RMS trajectory error: {rms_error}",
+                scene.title()
+            );
+            assert!(
+                maximum_error < 1.0e-8,
+                "{} direct-vs-dual maximum trajectory error: {maximum_error}",
+                scene.title()
+            );
         }
     }
 
