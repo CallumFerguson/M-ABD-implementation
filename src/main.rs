@@ -33,6 +33,7 @@ const PARALLEL_JOINT_THRESHOLD: usize = 15_000;
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_CORRECTION_JOINT_THRESHOLD: usize = 8_000;
 const CONTACT_PROXY_CHUNK_SIZE: usize = 32;
+const ROD_COLLIDER_TRIM: f64 = (1.0 - ROD_LENGTH_FACTOR as f64) * 0.5;
 
 const HUB_RADIUS: f32 = 0.075;
 const ROD_THICKNESS: f32 = 0.055;
@@ -1616,9 +1617,12 @@ fn refresh_contact_proxy(
             proxy_end[body_index] = center;
         }
         BodyKind::Rod => {
-            let (start, end) = rod_collider_attachments(body_index);
-            proxy_start[body_index] = attachment_position(bodies, start);
-            proxy_end[body_index] = attachment_position(bodies, end);
+            let positions = &bodies[body_index].positions;
+            let joint_start = positions[0] * 0.5 + positions[1] * 0.5;
+            let joint_end = positions[2] * 0.5 + positions[3] * 0.5;
+            let trim_offset = (joint_end - joint_start) * ROD_COLLIDER_TRIM;
+            proxy_start[body_index] = joint_start + trim_offset;
+            proxy_end[body_index] = joint_end - trim_offset;
         }
         BodyKind::Ball => {}
     }
@@ -1788,7 +1792,6 @@ fn apply_attachment_position_delta(
 }
 
 fn rod_collider_attachments(body: usize) -> (Attachment, Attachment) {
-    let trim = (1.0 - ROD_LENGTH_FACTOR as f64) * 0.5;
     let start = Attachment {
         body,
         weights: ROD_START,
@@ -1798,8 +1801,8 @@ fn rod_collider_attachments(body: usize) -> (Attachment, Attachment) {
         weights: ROD_END,
     };
     (
-        interpolate_attachment(start, end, trim),
-        interpolate_attachment(start, end, 1.0 - trim),
+        interpolate_attachment(start, end, ROD_COLLIDER_TRIM),
+        interpolate_attachment(start, end, 1.0 - ROD_COLLIDER_TRIM),
     )
 }
 
@@ -2977,6 +2980,56 @@ mod tests {
             assert!(
                 maximum_error < 1.0e-14,
                 "cached contact projection error after {warmup_steps} steps: {maximum_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn specialized_contact_proxies_match_attachment_reference() {
+        for (grid_size, warmup_steps) in [(10, 0), (10, 20), (10, 100), (25, 20)] {
+            let mut simulation = NetSimulation::with_grid_size(DemoScene::FallingBalls, grid_size);
+            for _ in 0..warmup_steps {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let net_body_count = simulation.ball_indices[0];
+            let mut proxy_start = vec![DVec3::ZERO; simulation.bodies.len()];
+            let mut proxy_end = vec![DVec3::ZERO; simulation.bodies.len()];
+            let mut maximum_error = 0.0_f64;
+            for body_index in 0..net_body_count {
+                refresh_contact_proxy(
+                    &simulation.bodies,
+                    body_index,
+                    &mut proxy_start,
+                    &mut proxy_end,
+                );
+                let (expected_start, expected_end) = match simulation.bodies[body_index].kind {
+                    BodyKind::Hub { .. } => {
+                        let center = attachment_position(
+                            &simulation.bodies,
+                            Attachment {
+                                body: body_index,
+                                weights: HUB_CENTER,
+                            },
+                        );
+                        (center, center)
+                    }
+                    BodyKind::Rod => {
+                        let (start, end) = rod_collider_attachments(body_index);
+                        (
+                            attachment_position(&simulation.bodies, start),
+                            attachment_position(&simulation.bodies, end),
+                        )
+                    }
+                    BodyKind::Ball => unreachable!("balls follow all net bodies"),
+                };
+                maximum_error = maximum_error
+                    .max((proxy_start[body_index] - expected_start).length())
+                    .max((proxy_end[body_index] - expected_end).length());
+            }
+            assert!(
+                maximum_error < 1.0e-13,
+                "{grid_size}x{grid_size} proxy error after {warmup_steps} steps: {maximum_error}"
             );
         }
     }
