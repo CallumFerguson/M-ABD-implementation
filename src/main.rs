@@ -28,7 +28,7 @@ const DEMO_COUNT: usize = 3;
 const PARALLEL_PROJECTION_BODY_THRESHOLD: usize = 4_000;
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_CYLINDER_BODY_THRESHOLD: usize = 4_000;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 const PARALLEL_JOINT_THRESHOLD: usize = 15_000;
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_CORRECTION_JOINT_THRESHOLD: usize = 8_000;
@@ -284,11 +284,15 @@ impl AffineBody {
 fn project_corotated_shapes<const POLAR_ITERATIONS: usize>(
     bodies: &mut [AffineBody],
     grid_size: usize,
+    projected_hub_center: &mut [DVec3],
+    projected_rod_endpoints: &mut [DVec3],
 ) {
     let body_count = bodies.len();
     let hub_count = grid_size * grid_size;
     let rod_count = 2 * grid_size * (grid_size - 1);
     debug_assert!(hub_count + rod_count <= body_count);
+    debug_assert_eq!(projected_hub_center.len(), hub_count);
+    debug_assert_eq!(projected_rod_endpoints.len(), rod_count * 2);
     let (hubs, remaining) = bodies.split_at_mut(hub_count);
     let (rods, balls) = remaining.split_at_mut(rod_count);
 
@@ -304,17 +308,27 @@ fn project_corotated_shapes<const POLAR_ITERATIONS: usize>(
             let hub_chunk_size = hubs.len().div_ceil(hub_tasks);
             let rod_chunk_size = rods.len().div_ceil(rod_tasks);
             task_pool.scope(|scope| {
-                for chunk in rods.chunks_mut(rod_chunk_size) {
+                for (chunk, endpoint_chunk) in rods
+                    .chunks_mut(rod_chunk_size)
+                    .zip(projected_rod_endpoints.chunks_mut(rod_chunk_size * 2))
+                {
                     scope.spawn(async move {
-                        for body in chunk {
+                        for (body, endpoints) in
+                            chunk.iter_mut().zip(endpoint_chunk.chunks_exact_mut(2))
+                        {
                             body.project_rod_shape::<POLAR_ITERATIONS>();
+                            endpoints.copy_from_slice(&rod_joint_endpoints(&body.positions));
                         }
                     });
                 }
-                for chunk in hubs.chunks_mut(hub_chunk_size) {
+                for (chunk, center_chunk) in hubs
+                    .chunks_mut(hub_chunk_size)
+                    .zip(projected_hub_center.chunks_mut(hub_chunk_size))
+                {
                     scope.spawn(async move {
-                        for body in chunk {
+                        for (body, center) in chunk.iter_mut().zip(center_chunk) {
                             body.project_hub_shape();
+                            *center = hub_attachment_center(&body.positions);
                         }
                     });
                 }
@@ -326,11 +340,16 @@ fn project_corotated_shapes<const POLAR_ITERATIONS: usize>(
         }
     }
 
-    for hub in hubs {
+    for (hub, center) in hubs.iter_mut().zip(projected_hub_center) {
         hub.project_hub_shape();
+        *center = hub_attachment_center(&hub.positions);
     }
-    for rod in rods {
+    for (rod, endpoints) in rods
+        .iter_mut()
+        .zip(projected_rod_endpoints.chunks_exact_mut(2))
+    {
         rod.project_rod_shape::<POLAR_ITERATIONS>();
+        endpoints.copy_from_slice(&rod_joint_endpoints(&rod.positions));
     }
     for ball in balls {
         ball.project_ball_shape();
@@ -574,13 +593,11 @@ impl NetSimulation {
         }
 
         for _ in 0..COROTATED_ITERATIONS {
-            project_corotated_shapes::<POLAR_ITERATIONS>(&mut self.bodies, self.grid_size);
-
-            compute_joint_residuals(
-                &self.bodies,
-                &self.joints,
+            project_corotated_shapes::<POLAR_ITERATIONS>(
+                &mut self.bodies,
+                self.grid_size,
+                &mut self.solver_scratch.hub_weighted_residual,
                 &mut self.solver_scratch.constraint_residual,
-                self.grid_size * self.grid_size,
             );
 
             if DIRECT {
@@ -593,6 +610,11 @@ impl NetSimulation {
             } else {
                 #[cfg(test)]
                 {
+                    finalize_joint_residuals(
+                        &mut self.solver_scratch.constraint_residual,
+                        &self.solver_scratch.hub_weighted_residual,
+                        &self.solver_scratch.joint_hub,
+                    );
                     solve_dual_direct(&mut self.solver_scratch, self.grid_size);
                     apply_joint_correction(
                         &mut self.bodies,
@@ -1961,6 +1983,7 @@ fn prepare_direct_joint_solver(
     }
 }
 
+#[cfg(test)]
 fn compute_joint_residuals(
     bodies: &[AffineBody],
     joints: &[BallJoint],
@@ -2028,6 +2051,17 @@ fn compute_joint_residuals(
             end_hub[0] * 0.25 + end_hub[1] * 0.25 + end_hub[2] * 0.25 + end_hub[3] * 0.25;
         residual_pair[0] = positions[0] * 0.5 + positions[1] * 0.5 - start_hub_center;
         residual_pair[1] = positions[2] * 0.5 + positions[3] * 0.5 - end_hub_center;
+    }
+}
+
+#[cfg(test)]
+fn finalize_joint_residuals(
+    endpoint_or_residual: &mut [DVec3],
+    hub_centers: &[DVec3],
+    joint_hub: &[u32],
+) {
+    for (residual, &hub) in endpoint_or_residual.iter_mut().zip(joint_hub) {
+        *residual -= hub_centers[hub as usize];
     }
 }
 
@@ -2155,10 +2189,10 @@ fn project_joint_constraints_direct(
 ) {
     debug_assert_eq!(hub_count, grid_size * grid_size);
     let SolverScratch {
-        constraint_residual,
+        constraint_residual: endpoint_or_residual,
         joint_hub,
         rod_inverse_weight,
-        hub_weighted_residual: hub_delta,
+        hub_weighted_residual: hub_center_or_delta,
         hub_schur_factor,
         ..
     } = scratch;
@@ -2169,33 +2203,46 @@ fn project_joint_constraints_direct(
 
     for row in 0..grid_size {
         for column in 0..grid_size {
+            let hub_index = row * grid_size + column;
+            let center = hub_center_or_delta[hub_index];
             let mut weighted_residual = DVec3::ZERO;
             if column > 0 {
                 let rod = row * (grid_size - 1) + column - 1;
-                weighted_residual += constraint_residual[2 * rod + 1] * rod_inverse_weight[rod];
+                let endpoint = 2 * rod + 1;
+                let residual = endpoint_or_residual[endpoint] - center;
+                endpoint_or_residual[endpoint] = residual;
+                weighted_residual += residual * rod_inverse_weight[rod];
             }
             if column + 1 < grid_size {
                 let rod = row * (grid_size - 1) + column;
-                weighted_residual += constraint_residual[2 * rod] * rod_inverse_weight[rod];
+                let endpoint = 2 * rod;
+                let residual = endpoint_or_residual[endpoint] - center;
+                endpoint_or_residual[endpoint] = residual;
+                weighted_residual += residual * rod_inverse_weight[rod];
             }
             if row > 0 {
                 let rod = horizontal_rod_count + (row - 1) * grid_size + column;
-                weighted_residual += constraint_residual[2 * rod + 1] * rod_inverse_weight[rod];
+                let endpoint = 2 * rod + 1;
+                let residual = endpoint_or_residual[endpoint] - center;
+                endpoint_or_residual[endpoint] = residual;
+                weighted_residual += residual * rod_inverse_weight[rod];
             }
             if row + 1 < grid_size {
                 let rod = horizontal_rod_count + row * grid_size + column;
-                weighted_residual += constraint_residual[2 * rod] * rod_inverse_weight[rod];
+                let endpoint = 2 * rod;
+                let residual = endpoint_or_residual[endpoint] - center;
+                endpoint_or_residual[endpoint] = residual;
+                weighted_residual += residual * rod_inverse_weight[rod];
             }
 
-            let hub_index = row * grid_size + column;
             let delta = weighted_residual * hub_schur_factor[hub_index];
-            hub_delta[hub_index] = delta;
+            hub_center_or_delta[hub_index] = delta;
         }
     }
 
-    let constraint_residual = constraint_residual.as_slice();
+    let constraint_residual = endpoint_or_residual.as_slice();
     let joint_hub = joint_hub.as_slice();
-    let hub_delta = hub_delta.as_slice();
+    let hub_delta = hub_center_or_delta.as_slice();
 
     #[cfg(not(target_arch = "wasm32"))]
     if constraint_residual.len() >= PARALLEL_CORRECTION_JOINT_THRESHOLD
@@ -2575,6 +2622,19 @@ fn centroid(points: &[DVec3; 4]) -> DVec3 {
     (points[0] + points[1] + points[2] + points[3]) * 0.25
 }
 
+#[inline]
+fn hub_attachment_center(points: &[DVec3; 4]) -> DVec3 {
+    points[0] * 0.25 + points[1] * 0.25 + points[2] * 0.25 + points[3] * 0.25
+}
+
+#[inline]
+fn rod_joint_endpoints(points: &[DVec3; 4]) -> [DVec3; 2] {
+    [
+        points[0] * 0.5 + points[1] * 0.5,
+        points[2] * 0.5 + points[3] * 0.5,
+    ]
+}
+
 fn rod_deformation_gradient(points: &[DVec3; 4]) -> DMat3 {
     let inverse_four_half_length = 1.0 / (2.0 * GRID_SPACING);
     let inverse_four_radius = 1.0 / (2.0 * ROD_THICKNESS as f64);
@@ -2859,13 +2919,29 @@ mod tests {
                 body.project_corotated_shape_with_polar_iterations::<POLAR_NEWTON_ITERATIONS>();
             }
 
+            let hub_count = simulation.grid_size * simulation.grid_size;
+            let rod_count = simulation.joints.len() / 2;
+            let mut hub_centers = vec![DVec3::ZERO; hub_count];
+            let mut rod_endpoints = vec![DVec3::ZERO; rod_count * 2];
+
             project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(
                 &mut simulation.bodies,
                 simulation.grid_size,
+                &mut hub_centers,
+                &mut rod_endpoints,
             );
 
             for (parallel, sequential) in simulation.bodies.iter().zip(sequential) {
                 assert_eq!(parallel.positions, sequential.positions);
+            }
+            for (body, center) in simulation.bodies[..hub_count].iter().zip(hub_centers) {
+                assert_eq!(center, hub_attachment_center(&body.positions));
+            }
+            for (body, endpoints) in simulation.bodies[hub_count..hub_count + rod_count]
+                .iter()
+                .zip(rod_endpoints.chunks_exact(2))
+            {
+                assert_eq!(endpoints, rod_joint_endpoints(&body.positions));
             }
         }
     }
@@ -2964,7 +3040,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_joint_projection_matches_dual_projection() {
+    fn cached_joint_projection_matches_residual_projection() {
         #[cfg(not(target_arch = "wasm32"))]
         simulation_task_pool_options().create_default_pools();
 
@@ -2980,61 +3056,87 @@ mod tests {
                 }
 
                 let hub_count = grid_size * grid_size;
-                let mut direct_bodies = simulation.bodies.clone();
-                let mut dual_bodies = simulation.bodies.clone();
-                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(&mut direct_bodies, grid_size);
-                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(&mut dual_bodies, grid_size);
+                let mut cached_bodies = simulation.bodies.clone();
+                let mut residual_bodies = simulation.bodies.clone();
+                let mut cached_scratch =
+                    SolverScratch::new(cached_bodies.len(), &simulation.joints, hub_count);
+                let mut residual_scratch =
+                    SolverScratch::new(residual_bodies.len(), &simulation.joints, hub_count);
+                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(
+                    &mut cached_bodies,
+                    grid_size,
+                    &mut cached_scratch.hub_weighted_residual,
+                    &mut cached_scratch.constraint_residual,
+                );
+                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(
+                    &mut residual_bodies,
+                    grid_size,
+                    &mut residual_scratch.hub_weighted_residual,
+                    &mut residual_scratch.constraint_residual,
+                );
+                assert_eq!(cached_bodies.len(), residual_bodies.len());
+                assert_eq!(
+                    cached_scratch.hub_weighted_residual,
+                    residual_scratch.hub_weighted_residual
+                );
+                assert_eq!(
+                    cached_scratch.constraint_residual,
+                    residual_scratch.constraint_residual
+                );
 
-                let mut direct_scratch =
-                    SolverScratch::new(direct_bodies.len(), &simulation.joints, hub_count);
-                let mut dual_scratch =
-                    SolverScratch::new(dual_bodies.len(), &simulation.joints, hub_count);
                 prepare_direct_joint_solver(
-                    &direct_bodies,
+                    &cached_bodies,
                     &simulation.joints,
-                    &mut direct_scratch,
+                    &mut cached_scratch,
                 );
-                prepare_direct_joint_solver(&dual_bodies, &simulation.joints, &mut dual_scratch);
-                compute_joint_residuals(
-                    &direct_bodies,
+                prepare_direct_joint_solver(
+                    &residual_bodies,
                     &simulation.joints,
-                    &mut direct_scratch.constraint_residual,
+                    &mut residual_scratch,
+                );
+                let mut expected_residual = vec![DVec3::ZERO; simulation.joints.len()];
+                compute_joint_residuals(
+                    &residual_bodies,
+                    &simulation.joints,
+                    &mut expected_residual,
                     hub_count,
                 );
-                compute_joint_residuals(
-                    &dual_bodies,
-                    &simulation.joints,
-                    &mut dual_scratch.constraint_residual,
-                    hub_count,
+                finalize_joint_residuals(
+                    &mut residual_scratch.constraint_residual,
+                    &residual_scratch.hub_weighted_residual,
+                    &residual_scratch.joint_hub,
                 );
+                assert_eq!(residual_scratch.constraint_residual, expected_residual);
 
                 project_joint_constraints_direct(
-                    &mut direct_bodies,
-                    &mut direct_scratch,
+                    &mut cached_bodies,
+                    &mut cached_scratch,
                     hub_count,
                     grid_size,
                 );
-                solve_dual_direct(&mut dual_scratch, grid_size);
-                apply_joint_correction(
-                    &mut dual_bodies,
-                    &simulation.joints,
-                    &dual_scratch.solution,
-                    &mut dual_scratch.hub_weighted_residual,
-                    hub_count,
-                    grid_size,
-                );
-
-                let maximum_error = direct_bodies
+                solve_dual_direct(&mut residual_scratch, grid_size);
+                let expected_delta: Vec<DVec3> = residual_scratch
+                    .hub_weighted_residual
                     .iter()
-                    .zip(&dual_bodies)
-                    .flat_map(|(direct, dual)| direct.positions.iter().zip(dual.positions))
-                    .map(|(direct, dual)| (*direct - dual).length())
-                    .fold(0.0_f64, f64::max);
-                assert!(
-                    maximum_error < 2.0e-12,
-                    "{} {grid_size}x{grid_size} direct-vs-dual projection error: {maximum_error}",
-                    scene.title()
+                    .zip(&residual_scratch.hub_schur_factor)
+                    .map(|(&weighted_residual, &factor)| weighted_residual * factor)
+                    .collect();
+                assert_eq!(cached_scratch.constraint_residual, expected_residual);
+                assert_eq!(cached_scratch.hub_weighted_residual, expected_delta);
+
+                let rod_count = simulation.joints.len() / 2;
+                let (residual_hubs, remaining) = residual_bodies.split_at_mut(hub_count);
+                let residual_rods = &mut remaining[..rod_count];
+                apply_hub_joint_deltas(residual_hubs, &expected_delta);
+                project_rod_joint_constraints(
+                    residual_rods,
+                    &expected_residual,
+                    &residual_scratch.joint_hub,
+                    &expected_delta,
                 );
+                for (cached, residual) in cached_bodies.iter().zip(residual_bodies) {
+                    assert_eq!(cached.positions, residual.positions);
+                }
             }
         }
     }
