@@ -2,6 +2,8 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::tasks::ComputeTaskPool;
 use bevy::text::FontSize;
 use bevy::time::Fixed;
 use bevy::window::{PresentMode, WindowResolution};
@@ -22,6 +24,8 @@ const COROTATED_ITERATIONS: usize = 24;
 const POLAR_NEWTON_ITERATIONS: usize = 2;
 const CONTACT_PASSES: usize = 2;
 const DEMO_COUNT: usize = 3;
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_PROJECTION_BODY_THRESHOLD: usize = 4_000;
 
 const HUB_RADIUS: f32 = 0.075;
 const ROD_THICKNESS: f32 = 0.055;
@@ -246,6 +250,33 @@ impl AffineBody {
     }
 }
 
+fn project_corotated_shapes<const POLAR_ITERATIONS: usize>(bodies: &mut [AffineBody]) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if bodies.len() >= PARALLEL_PROJECTION_BODY_THRESHOLD
+        && let Some(task_pool) = ComputeTaskPool::try_get()
+    {
+        let task_count = task_pool.thread_num().saturating_mul(4).max(1);
+        if task_count > 1 {
+            let chunk_size = bodies.len().div_ceil(task_count);
+            task_pool.scope(|scope| {
+                for chunk in bodies.chunks_mut(chunk_size) {
+                    scope.spawn(async move {
+                        for body in chunk {
+                            body.project_corotated_shape_with_polar_iterations::<POLAR_ITERATIONS>(
+                            );
+                        }
+                    });
+                }
+            });
+            return;
+        }
+    }
+
+    for body in bodies {
+        body.project_corotated_shape_with_polar_iterations::<POLAR_ITERATIONS>();
+    }
+}
+
 fn velocity_damping_for_dt(dt: f64) -> f64 {
     VELOCITY_DAMPING_AT_DEFAULT_HZ.powf(dt * DEFAULT_FIXED_HZ)
 }
@@ -448,9 +479,7 @@ impl NetSimulation {
         prepare_direct_joint_solver(&self.bodies, &self.joints, &mut self.solver_scratch);
 
         for _ in 0..COROTATED_ITERATIONS {
-            for body in &mut self.bodies {
-                body.project_corotated_shape_with_polar_iterations::<POLAR_ITERATIONS>();
-            }
+            project_corotated_shapes::<POLAR_ITERATIONS>(&mut self.bodies);
 
             compute_joint_residuals(
                 &self.bodies,
@@ -527,6 +556,20 @@ struct VisualAssets {
     cylinder_material: Handle<StandardMaterial>,
 }
 
+fn simulation_task_pool_options() -> TaskPoolOptions {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut options = TaskPoolOptions::default();
+        options.io.max_threads = 1;
+        options.async_compute.max_threads = 1;
+        options
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        TaskPoolOptions::default()
+    }
+}
+
 fn main() {
     let mut app = App::new();
     app.insert_non_send(PhysxDemo::new())
@@ -539,18 +582,24 @@ fn main() {
         })
         .insert_resource(NetSimulation::new(DemoScene::JointGrid))
         .init_resource::<SimulationTiming>()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "M-ABD Physics Comparison".into(),
-                resolution: WindowResolution::new(1100, 700),
-                present_mode: PresentMode::AutoVsync,
-                canvas: Some("#bevy-canvas".into()),
-                fit_canvas_to_parent: true,
-                prevent_default_event_handling: false,
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(TaskPoolPlugin {
+                    task_pool_options: simulation_task_pool_options(),
+                })
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "M-ABD Physics Comparison".into(),
+                        resolution: WindowResolution::new(1100, 700),
+                        present_mode: PresentMode::AutoVsync,
+                        canvas: Some("#bevy-canvas".into()),
+                        fit_canvas_to_parent: true,
+                        prevent_default_event_handling: false,
+                        ..default()
+                    }),
+                    ..default()
+                }),
+        )
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_systems(Startup, setup_scene)
         .add_systems(FixedUpdate, (step_simulation, step_physx_simulation))
@@ -2118,7 +2167,31 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parallel_shape_projection_matches_sequential_projection() {
+        simulation_task_pool_options().create_default_pools();
+
+        let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, 50);
+        for body in &mut simulation.bodies {
+            body.predict(1.0 / DEFAULT_FIXED_HZ);
+        }
+        let mut sequential = simulation.bodies.clone();
+        for body in &mut sequential {
+            body.project_corotated_shape_with_polar_iterations::<POLAR_NEWTON_ITERATIONS>();
+        }
+
+        project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(&mut simulation.bodies);
+
+        for (parallel, sequential) in simulation.bodies.iter().zip(sequential) {
+            assert_eq!(parallel.positions, sequential.positions);
+        }
+    }
+
     fn report_step_time(scene: DemoScene) {
+        #[cfg(not(target_arch = "wasm32"))]
+        simulation_task_pool_options().create_default_pools();
+
         let dt = 1.0 / DEFAULT_FIXED_HZ;
         let grid_size = std::env::var(STEP_TIME_GRID_ENV)
             .ok()
