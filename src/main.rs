@@ -323,7 +323,7 @@ struct SolverScratch {
     constraint_residual: Vec<DVec3>,
     solution: Vec<DVec3>,
     joint_hub: Vec<u32>,
-    joint_rod_inverse_weight: Vec<f64>,
+    rod_inverse_weight: Vec<f64>,
     hub_inverse_rod_weight_sum: Vec<f64>,
     hub_weighted_residual: Vec<DVec3>,
     hub_schur_factor: Vec<f64>,
@@ -335,6 +335,7 @@ struct SolverScratch {
 
 impl SolverScratch {
     fn new(body_count: usize, joints: &[BallJoint], hub_count: usize) -> Self {
+        debug_assert_eq!(joints.len() % 2, 0);
         Self {
             constraint_residual: vec![DVec3::ZERO; joints.len()],
             solution: vec![DVec3::ZERO; joints.len()],
@@ -342,7 +343,7 @@ impl SolverScratch {
                 .iter()
                 .map(|joint| u32::try_from(joint.b.body).expect("hub index must fit in u32"))
                 .collect(),
-            joint_rod_inverse_weight: vec![0.0; joints.len()],
+            rod_inverse_weight: vec![0.0; joints.len() / 2],
             hub_inverse_rod_weight_sum: vec![0.0; hub_count],
             hub_weighted_residual: vec![DVec3::ZERO; hub_count],
             hub_schur_factor: vec![0.0; hub_count],
@@ -1786,10 +1787,11 @@ fn prepare_direct_joint_solver(
 ) {
     scratch.hub_inverse_rod_weight_sum.fill(0.0);
 
-    for (index, joint) in joints.iter().enumerate() {
-        let inverse_rod_weight = (bodies[joint.a.body].inverse_diagonal * 0.5).recip();
-        scratch.joint_rod_inverse_weight[index] = inverse_rod_weight;
-        scratch.hub_inverse_rod_weight_sum[joint.b.body] += inverse_rod_weight;
+    for (rod, joint_pair) in joints.chunks_exact(2).enumerate() {
+        let inverse_rod_weight = (bodies[joint_pair[0].a.body].inverse_diagonal * 0.5).recip();
+        scratch.rod_inverse_weight[rod] = inverse_rod_weight;
+        scratch.hub_inverse_rod_weight_sum[joint_pair[0].b.body] += inverse_rod_weight;
+        scratch.hub_inverse_rod_weight_sum[joint_pair[1].b.body] += inverse_rod_weight;
     }
 
     for (index, factor) in scratch.hub_schur_factor.iter_mut().enumerate() {
@@ -1935,7 +1937,7 @@ fn solve_dual_direct(scratch: &mut SolverScratch, grid_size: usize) {
         constraint_residual: residual,
         solution,
         joint_hub,
-        joint_rod_inverse_weight,
+        rod_inverse_weight,
         hub_weighted_residual,
         hub_schur_factor,
         ..
@@ -1947,29 +1949,39 @@ fn solve_dual_direct(scratch: &mut SolverScratch, grid_size: usize) {
         for column in 0..grid_size {
             let mut weighted_residual = DVec3::ZERO;
             if column > 0 {
-                let joint = 2 * (row * (grid_size - 1) + column - 1) + 1;
-                weighted_residual += residual[joint] * joint_rod_inverse_weight[joint];
+                let rod = row * (grid_size - 1) + column - 1;
+                weighted_residual += residual[2 * rod + 1] * rod_inverse_weight[rod];
             }
             if column + 1 < grid_size {
-                let joint = 2 * (row * (grid_size - 1) + column);
-                weighted_residual += residual[joint] * joint_rod_inverse_weight[joint];
+                let rod = row * (grid_size - 1) + column;
+                weighted_residual += residual[2 * rod] * rod_inverse_weight[rod];
             }
             if row > 0 {
-                let joint = 2 * (horizontal_rod_count + (row - 1) * grid_size + column) + 1;
-                weighted_residual += residual[joint] * joint_rod_inverse_weight[joint];
+                let rod = horizontal_rod_count + (row - 1) * grid_size + column;
+                weighted_residual += residual[2 * rod + 1] * rod_inverse_weight[rod];
             }
             if row + 1 < grid_size {
-                let joint = 2 * (horizontal_rod_count + row * grid_size + column);
-                weighted_residual += residual[joint] * joint_rod_inverse_weight[joint];
+                let rod = horizontal_rod_count + row * grid_size + column;
+                weighted_residual += residual[2 * rod] * rod_inverse_weight[rod];
             }
             hub_weighted_residual[row * grid_size + column] = weighted_residual;
         }
     }
 
-    for (index, hub) in joint_hub.iter().copied().enumerate() {
-        let hub = hub as usize;
-        solution[index] = (residual[index] - hub_weighted_residual[hub] * hub_schur_factor[hub])
-            * joint_rod_inverse_weight[index];
+    for (((solution_pair, residual_pair), hub_pair), &inverse_rod_weight) in solution
+        .chunks_exact_mut(2)
+        .zip(residual.chunks_exact(2))
+        .zip(joint_hub.chunks_exact(2))
+        .zip(rod_inverse_weight.iter())
+    {
+        let start_hub = hub_pair[0] as usize;
+        solution_pair[0] = (residual_pair[0]
+            - hub_weighted_residual[start_hub] * hub_schur_factor[start_hub])
+            * inverse_rod_weight;
+        let end_hub = hub_pair[1] as usize;
+        solution_pair[1] = (residual_pair[1]
+            - hub_weighted_residual[end_hub] * hub_schur_factor[end_hub])
+            * inverse_rod_weight;
     }
 }
 
@@ -2707,7 +2719,7 @@ mod tests {
         for (index, joint) in simulation.joints.iter().enumerate() {
             expected_hub_residual[joint.b.body] += simulation.solver_scratch.constraint_residual
                 [index]
-                * simulation.solver_scratch.joint_rod_inverse_weight[index];
+                * simulation.solver_scratch.rod_inverse_weight[index / 2];
         }
         let expected_solution = simulation
             .joints
@@ -2717,7 +2729,7 @@ mod tests {
                 let hub = joint.b.body;
                 (simulation.solver_scratch.constraint_residual[index]
                     - expected_hub_residual[hub] * simulation.solver_scratch.hub_schur_factor[hub])
-                    * simulation.solver_scratch.joint_rod_inverse_weight[index]
+                    * simulation.solver_scratch.rod_inverse_weight[index / 2]
             })
             .collect::<Vec<_>>();
 
@@ -2728,6 +2740,45 @@ mod tests {
             expected_hub_residual
         );
         assert_eq!(simulation.solver_scratch.solution, expected_solution);
+    }
+
+    #[test]
+    fn per_rod_inverse_weights_match_per_joint_reference() {
+        let grid_size = GRID_SIZE_OPTIONS[1];
+        let hub_count = grid_size * grid_size;
+        let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, grid_size);
+        for body in &mut simulation.bodies {
+            body.predict(1.0 / DEFAULT_FIXED_HZ);
+        }
+        for (rod, body) in simulation.bodies[hub_count..].iter_mut().enumerate() {
+            body.inverse_diagonal = 1.0e-5 + rod as f64 * 1.0e-10;
+        }
+
+        let mut expected_weights = Vec::with_capacity(simulation.joints.len());
+        let mut expected_hub_sums = vec![0.0; hub_count];
+        for joint in &simulation.joints {
+            let inverse_rod_weight =
+                (simulation.bodies[joint.a.body].inverse_diagonal * 0.5).recip();
+            expected_weights.push(inverse_rod_weight);
+            expected_hub_sums[joint.b.body] += inverse_rod_weight;
+        }
+
+        prepare_direct_joint_solver(
+            &simulation.bodies,
+            &simulation.joints,
+            &mut simulation.solver_scratch,
+        );
+
+        for (joint, expected) in expected_weights.iter().enumerate() {
+            assert_eq!(
+                simulation.solver_scratch.rod_inverse_weight[joint / 2].to_bits(),
+                expected.to_bits()
+            );
+        }
+        assert_eq!(
+            simulation.solver_scratch.hub_inverse_rod_weight_sum,
+            expected_hub_sums
+        );
     }
 
     #[test]
