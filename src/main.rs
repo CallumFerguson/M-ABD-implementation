@@ -189,39 +189,63 @@ impl AffineBody {
         self.project_corotated_shape_with_polar_iterations::<POLAR_NEWTON_ITERATIONS>();
     }
 
+    #[cfg(test)]
     fn project_corotated_shape_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self) {
-        if self.fixed {
-            return;
+        match self.kind {
+            BodyKind::Hub { .. } => self.project_hub_shape(),
+            BodyKind::Rod => self.project_rod_shape::<POLAR_ITERATIONS>(),
+            BodyKind::Ball => self.project_ball_shape(),
         }
+    }
 
+    #[inline]
+    fn project_rod_shape<const POLAR_ITERATIONS: usize>(&mut self) {
         let center = self.centroid();
         let prediction_weight = self.inertia * self.inverse_diagonal;
         let shape_weight = AFFINE_STIFFNESS * self.inverse_diagonal;
-        match self.kind {
-            BodyKind::Rod => {
-                let rotation = closest_rotation_with_iterations::<POLAR_ITERATIONS>(
-                    rod_deformation_gradient(&self.positions),
-                );
-                let half_length = GRID_SPACING * 0.5;
-                let radius = ROD_THICKNESS as f64 * 0.5;
-                let x = rotation.x_axis * half_length;
-                let y = rotation.y_axis * radius;
-                let z = rotation.z_axis * radius;
-                let rigid_offsets = [-x - y - z, -x + y + z, x - y + z, x + y - z];
-                for index in 0..4 {
-                    let rigid_target = center + rigid_offsets[index];
-                    self.positions[index] = self.predicted_positions[index] * prediction_weight
-                        + rigid_target * shape_weight;
-                }
-            }
-            BodyKind::Hub { .. } | BodyKind::Ball => {
-                let predicted_center = centroid(&self.predicted_positions);
-                let projected_center = predicted_center * prediction_weight + center * shape_weight;
-                let rest_points = body_rest_points(self.kind);
-                for index in 0..4 {
-                    self.positions[index] = projected_center + rest_points[index];
-                }
-            }
+        let rotation = closest_rotation_with_iterations::<POLAR_ITERATIONS>(
+            rod_deformation_gradient(&self.positions),
+        );
+        let half_length = GRID_SPACING * 0.5;
+        let radius = ROD_THICKNESS as f64 * 0.5;
+        let x = rotation.x_axis * half_length;
+        let y = rotation.y_axis * radius;
+        let z = rotation.z_axis * radius;
+        let rigid_offsets = [-x - y - z, -x + y + z, x - y + z, x + y - z];
+        for index in 0..4 {
+            let rigid_target = center + rigid_offsets[index];
+            self.positions[index] =
+                self.predicted_positions[index] * prediction_weight + rigid_target * shape_weight;
+        }
+    }
+
+    #[inline]
+    fn project_hub_shape(&mut self) {
+        if self.fixed {
+            return;
+        }
+        self.project_center_attached_shape::<false>();
+    }
+
+    #[inline]
+    fn project_ball_shape(&mut self) {
+        self.project_center_attached_shape::<true>();
+    }
+
+    #[inline]
+    fn project_center_attached_shape<const BALL: bool>(&mut self) {
+        let center = self.centroid();
+        let prediction_weight = self.inertia * self.inverse_diagonal;
+        let shape_weight = AFFINE_STIFFNESS * self.inverse_diagonal;
+        let predicted_center = centroid(&self.predicted_positions);
+        let projected_center = predicted_center * prediction_weight + center * shape_weight;
+        let rest_points = if BALL {
+            ball_rest_points()
+        } else {
+            hub_rest_points()
+        };
+        for index in 0..4 {
+            self.positions[index] = projected_center + rest_points[index];
         }
     }
 
@@ -258,30 +282,59 @@ impl AffineBody {
     }
 }
 
-fn project_corotated_shapes<const POLAR_ITERATIONS: usize>(bodies: &mut [AffineBody]) {
+fn project_corotated_shapes<const POLAR_ITERATIONS: usize>(
+    bodies: &mut [AffineBody],
+    grid_size: usize,
+) {
+    let body_count = bodies.len();
+    let hub_count = grid_size * grid_size;
+    let rod_count = 2 * grid_size * (grid_size - 1);
+    debug_assert!(hub_count + rod_count <= body_count);
+    let (hubs, remaining) = bodies.split_at_mut(hub_count);
+    let (rods, balls) = remaining.split_at_mut(rod_count);
+
     #[cfg(not(target_arch = "wasm32"))]
-    if bodies.len() >= PARALLEL_PROJECTION_BODY_THRESHOLD
+    if body_count >= PARALLEL_PROJECTION_BODY_THRESHOLD
         && let Some(task_pool) = ComputeTaskPool::try_get()
     {
-        let task_count = task_pool.thread_num().saturating_mul(4).max(1);
-        if task_count > 1 {
-            let chunk_size = bodies.len().div_ceil(task_count);
+        let worker_count = task_pool.thread_num();
+        let total_tasks = worker_count.saturating_mul(4);
+        let hub_tasks = worker_count.min(hubs.len()).max(1);
+        let rod_tasks = total_tasks.saturating_sub(hub_tasks).min(rods.len()).max(1);
+        if worker_count > 1 {
+            let hub_chunk_size = hubs.len().div_ceil(hub_tasks);
+            let rod_chunk_size = rods.len().div_ceil(rod_tasks);
             task_pool.scope(|scope| {
-                for chunk in bodies.chunks_mut(chunk_size) {
+                for chunk in rods.chunks_mut(rod_chunk_size) {
                     scope.spawn(async move {
                         for body in chunk {
-                            body.project_corotated_shape_with_polar_iterations::<POLAR_ITERATIONS>(
-                            );
+                            body.project_rod_shape::<POLAR_ITERATIONS>();
+                        }
+                    });
+                }
+                for chunk in hubs.chunks_mut(hub_chunk_size) {
+                    scope.spawn(async move {
+                        for body in chunk {
+                            body.project_hub_shape();
                         }
                     });
                 }
             });
+            for ball in balls {
+                ball.project_ball_shape();
+            }
             return;
         }
     }
 
-    for body in bodies {
-        body.project_corotated_shape_with_polar_iterations::<POLAR_ITERATIONS>();
+    for hub in hubs {
+        hub.project_hub_shape();
+    }
+    for rod in rods {
+        rod.project_rod_shape::<POLAR_ITERATIONS>();
+    }
+    for ball in balls {
+        ball.project_ball_shape();
     }
 }
 
@@ -497,7 +550,7 @@ impl NetSimulation {
         prepare_direct_joint_solver(&self.bodies, &self.joints, &mut self.solver_scratch);
 
         for _ in 0..COROTATED_ITERATIONS {
-            project_corotated_shapes::<POLAR_ITERATIONS>(&mut self.bodies);
+            project_corotated_shapes::<POLAR_ITERATIONS>(&mut self.bodies, self.grid_size);
 
             compute_joint_residuals(
                 &self.bodies,
@@ -2306,6 +2359,7 @@ fn accumulate_attachment(points: &mut [DVec3; 4], weights: [f64; 4], value: DVec
     }
 }
 
+#[cfg(test)]
 fn body_rest_points(kind: BodyKind) -> [DVec3; 4] {
     match kind {
         BodyKind::Hub { .. } => hub_rest_points(),
@@ -2545,19 +2599,24 @@ mod tests {
     fn parallel_shape_projection_matches_sequential_projection() {
         simulation_task_pool_options().create_default_pools();
 
-        let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, 50);
-        for body in &mut simulation.bodies {
-            body.predict(1.0 / DEFAULT_FIXED_HZ);
-        }
-        let mut sequential = simulation.bodies.clone();
-        for body in &mut sequential {
-            body.project_corotated_shape_with_polar_iterations::<POLAR_NEWTON_ITERATIONS>();
-        }
+        for scene in [DemoScene::JointGrid, DemoScene::FallingBalls] {
+            let mut simulation = NetSimulation::with_grid_size(scene, 50);
+            for body in &mut simulation.bodies {
+                body.predict(1.0 / DEFAULT_FIXED_HZ);
+            }
+            let mut sequential = simulation.bodies.clone();
+            for body in &mut sequential {
+                body.project_corotated_shape_with_polar_iterations::<POLAR_NEWTON_ITERATIONS>();
+            }
 
-        project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(&mut simulation.bodies);
+            project_corotated_shapes::<POLAR_NEWTON_ITERATIONS>(
+                &mut simulation.bodies,
+                simulation.grid_size,
+            );
 
-        for (parallel, sequential) in simulation.bodies.iter().zip(sequential) {
-            assert_eq!(parallel.positions, sequential.positions);
+            for (parallel, sequential) in simulation.bodies.iter().zip(sequential) {
+                assert_eq!(parallel.positions, sequential.positions);
+            }
         }
     }
 
