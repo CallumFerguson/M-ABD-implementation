@@ -164,18 +164,31 @@ impl AffineBody {
         }
     }
 
-    fn predict(&mut self, dt: f64) {
-        self.previous_positions = self.positions;
-
+    fn update_time_step_coefficients(&mut self, dt: f64) {
         if self.fixed {
-            self.predicted_positions = self.positions;
-            self.velocities = [DVec3::ZERO; 4];
+            self.inertia = 0.0;
             self.inverse_diagonal = 0.0;
             return;
         }
 
         self.inertia = body_mass_per_point(self.kind) / (dt * dt);
         self.inverse_diagonal = 1.0 / (self.inertia + AFFINE_STIFFNESS);
+    }
+
+    #[cfg(test)]
+    fn predict(&mut self, dt: f64) {
+        self.update_time_step_coefficients(dt);
+        self.predict_positions(dt);
+    }
+
+    fn predict_positions(&mut self, dt: f64) {
+        self.previous_positions = self.positions;
+
+        if self.fixed {
+            self.predicted_positions = self.positions;
+            self.velocities = [DVec3::ZERO; 4];
+            return;
+        }
 
         for index in 0..4 {
             self.predicted_positions[index] =
@@ -371,6 +384,7 @@ struct NetSimulation {
     cylinder: Option<CylinderCollider>,
     ball_indices: Vec<usize>,
     solver_scratch: SolverScratch,
+    coefficient_dt_bits: u64,
 }
 
 struct SolverScratch {
@@ -535,6 +549,7 @@ impl NetSimulation {
             cylinder,
             ball_indices,
             solver_scratch,
+            coefficient_dt_bits: u64::MAX,
         }
     }
 
@@ -543,11 +558,18 @@ impl NetSimulation {
     }
 
     fn step_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self, dt: f64) {
-        for body in &mut self.bodies {
-            body.predict(dt);
+        let dt_bits = dt.to_bits();
+        if self.coefficient_dt_bits != dt_bits {
+            for body in &mut self.bodies {
+                body.update_time_step_coefficients(dt);
+            }
+            prepare_direct_joint_solver(&self.bodies, &self.joints, &mut self.solver_scratch);
+            self.coefficient_dt_bits = dt_bits;
         }
 
-        prepare_direct_joint_solver(&self.bodies, &self.joints, &mut self.solver_scratch);
+        for body in &mut self.bodies {
+            body.predict_positions(dt);
+        }
 
         for _ in 0..COROTATED_ITERATIONS {
             project_corotated_shapes::<POLAR_ITERATIONS>(&mut self.bodies, self.grid_size);
@@ -3486,6 +3508,56 @@ mod tests {
 
             assert!((measured_hz - hz).abs() < 1.0e-4);
             assert!((one_second_damping - expected_one_second_damping).abs() < 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn cached_time_step_coefficients_match_forced_rebuilds() {
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut cached = NetSimulation::new(scene);
+            let mut rebuilt = NetSimulation::new(scene);
+            for dt in [1.0 / 30.0, 1.0 / 30.0, 1.0 / 60.0, 1.0 / 60.0, 1.0 / 30.0] {
+                cached.step(dt);
+                rebuilt.coefficient_dt_bits = u64::MAX;
+                rebuilt.step(dt);
+
+                for (cached_body, rebuilt_body) in cached.bodies.iter().zip(&rebuilt.bodies) {
+                    assert_eq!(cached_body.positions, rebuilt_body.positions);
+                    assert_eq!(
+                        cached_body.previous_positions,
+                        rebuilt_body.previous_positions
+                    );
+                    assert_eq!(
+                        cached_body.predicted_positions,
+                        rebuilt_body.predicted_positions
+                    );
+                    assert_eq!(cached_body.velocities, rebuilt_body.velocities);
+                    assert_eq!(
+                        cached_body.inertia.to_bits(),
+                        rebuilt_body.inertia.to_bits()
+                    );
+                    assert_eq!(
+                        cached_body.inverse_diagonal.to_bits(),
+                        rebuilt_body.inverse_diagonal.to_bits()
+                    );
+                }
+                assert_eq!(
+                    cached.solver_scratch.rod_inverse_weight,
+                    rebuilt.solver_scratch.rod_inverse_weight
+                );
+                assert_eq!(
+                    cached.solver_scratch.hub_inverse_rod_weight_sum,
+                    rebuilt.solver_scratch.hub_inverse_rod_weight_sum
+                );
+                assert_eq!(
+                    cached.solver_scratch.hub_schur_factor,
+                    rebuilt.solver_scratch.hub_schur_factor
+                );
+            }
         }
     }
 
