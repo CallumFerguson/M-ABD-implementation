@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "build": "trunk build --release",
+    "build:fast": "trunk build --cargo-profile release",
     "serve": "trunk serve"
   },
   "dependencies": {

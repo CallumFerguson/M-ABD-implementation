@@ -141,10 +141,25 @@ npm run serve -- --open
 ```
 
 The site is available at <http://127.0.0.1:8080> if it does not open
-automatically. Create a deployable build with:
+automatically. For a quick optimized browser build while iterating, use:
+
+```sh
+npm run build:fast
+```
+
+This still uses Cargo's optimized `release` profile, but skips Trunk's slow
+whole-module `wasm-opt` post-processing. Create the smaller, fully processed
+deployable bundle when needed with:
 
 ```sh
 npm run build
+```
+
+For final native runtime comparisons, Cargo also provides the more expensive
+fat-LTO profile explicitly:
+
+```sh
+cargo build --profile max-performance --no-default-features
 ```
 
 ## MVP scope
