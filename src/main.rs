@@ -415,15 +415,11 @@ impl NetSimulation {
                 body.project_corotated_shape();
             }
 
-            for (residual, joint) in self
-                .solver_scratch
-                .constraint_residual
-                .iter_mut()
-                .zip(&self.joints)
-            {
-                *residual = attachment_position(&self.bodies, joint.a)
-                    - attachment_position(&self.bodies, joint.b);
-            }
+            compute_joint_residuals(
+                &self.bodies,
+                &self.joints,
+                &mut self.solver_scratch.constraint_residual,
+            );
 
             solve_dual_direct(&self.joints, &mut self.solver_scratch);
             apply_joint_correction(
@@ -1579,8 +1575,34 @@ fn prepare_direct_joint_solver(
 
     for (index, joint) in joints.iter().enumerate() {
         scratch.joint_rod_inverse_weight[index] =
-            attachment_inverse_weight(bodies, joint.a).recip();
-        scratch.hub_coupling[joint.b.body] = attachment_inverse_weight(bodies, joint.b);
+            (bodies[joint.a.body].inverse_diagonal * 0.5).recip();
+        scratch.hub_coupling[joint.b.body] = bodies[joint.b.body].inverse_diagonal * 0.25;
+    }
+}
+
+fn compute_joint_residuals(bodies: &[AffineBody], joints: &[BallJoint], residuals: &mut [DVec3]) {
+    for (residual, joint) in residuals.iter_mut().zip(joints) {
+        let rod = &bodies[joint.a.body].positions;
+        let rod_endpoint = if joint.a.weights[0] != 0.0 {
+            rod[0] * 0.5 + rod[1] * 0.5
+        } else {
+            debug_assert_eq!(joint.a.weights, ROD_END);
+            rod[2] * 0.5 + rod[3] * 0.5
+        };
+        let hub = &bodies[joint.b.body].positions;
+        let hub_center = hub[0] * 0.25 + hub[1] * 0.25 + hub[2] * 0.25 + hub[3] * 0.25;
+        *residual = rod_endpoint - hub_center;
+    }
+}
+
+#[cfg(test)]
+fn compute_joint_residuals_generic(
+    bodies: &[AffineBody],
+    joints: &[BallJoint],
+    residuals: &mut [DVec3],
+) {
+    for (residual, joint) in residuals.iter_mut().zip(joints) {
+        *residual = attachment_position(bodies, joint.a) - attachment_position(bodies, joint.b);
     }
 }
 
@@ -1697,9 +1719,14 @@ fn apply_joint_correction(
 
     for (joint, multiplier) in joints.iter().zip(multipliers) {
         let rod = &mut bodies[joint.a.body];
-        for (position, weight) in rod.positions.iter_mut().zip(joint.a.weights) {
-            let force = *multiplier * weight;
-            *position -= force * rod.inverse_diagonal;
+        let correction = (*multiplier * 0.5) * rod.inverse_diagonal;
+        if joint.a.weights[0] != 0.0 {
+            rod.positions[0] -= correction;
+            rod.positions[1] -= correction;
+        } else {
+            debug_assert_eq!(joint.a.weights, ROD_END);
+            rod.positions[2] -= correction;
+            rod.positions[3] -= correction;
         }
         hub_forces[joint.b.body] += -*multiplier * HUB_CENTER[0];
     }
@@ -2064,6 +2091,32 @@ mod tests {
             assert!(
                 maximum_error < 1.0e-15,
                 "{} specialized correction error: {maximum_error}",
+                scene.title()
+            );
+        }
+    }
+
+    #[test]
+    fn specialized_joint_residuals_match_generic_attachments() {
+        for scene in [DemoScene::JointGrid, DemoScene::FallingBalls] {
+            let mut simulation = NetSimulation::new(scene);
+            for _ in 0..20 {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let mut specialized = vec![DVec3::ZERO; simulation.joints.len()];
+            let mut generic = vec![DVec3::ZERO; simulation.joints.len()];
+            compute_joint_residuals(&simulation.bodies, &simulation.joints, &mut specialized);
+            compute_joint_residuals_generic(&simulation.bodies, &simulation.joints, &mut generic);
+
+            let maximum_error = specialized
+                .iter()
+                .zip(&generic)
+                .map(|(specialized, generic)| (*specialized - *generic).length())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                maximum_error < 1.0e-15,
+                "{} specialized residual error: {maximum_error}",
                 scene.title()
             );
         }
