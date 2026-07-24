@@ -184,11 +184,38 @@ impl AffineBody {
         }
 
         let center = self.centroid();
+        match self.kind {
+            BodyKind::Rod => {
+                let rotation = closest_rotation(rod_deformation_gradient(&self.positions));
+                for index in 0..4 {
+                    let rigid_target = center + rotation * self.rest_points[index];
+                    self.positions[index] = (self.predicted_positions[index] * self.inertia
+                        + rigid_target * self.stiffness)
+                        * self.inverse_diagonal;
+                }
+            }
+            BodyKind::Hub { .. } | BodyKind::Ball => {
+                let predicted_center = centroid(&self.predicted_positions);
+                let projected_center = (predicted_center * self.inertia + center * self.stiffness)
+                    * self.inverse_diagonal;
+                for index in 0..4 {
+                    self.positions[index] = projected_center + self.rest_points[index];
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn project_corotated_shape_reference(&mut self) {
+        if self.fixed {
+            return;
+        }
+
+        let center = self.centroid();
         let rotation = match self.kind {
             BodyKind::Rod => closest_rotation(rod_deformation_gradient(&self.positions)),
             BodyKind::Hub { .. } | BodyKind::Ball => DMat3::IDENTITY,
         };
-
         for index in 0..4 {
             let rigid_target = center + rotation * self.rest_points[index];
             self.positions[index] = (self.predicted_positions[index] * self.inertia
@@ -2186,6 +2213,41 @@ mod tests {
             maximum_error < 1.0e-12,
             "specialized cylinder projection error: {maximum_error}"
         );
+    }
+
+    #[test]
+    fn specialized_center_projection_matches_generic_shape_projection() {
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut simulation = NetSimulation::new(scene);
+            for _ in 0..20 {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let mut maximum_error = 0.0_f64;
+            for body in &simulation.bodies {
+                if !matches!(body.kind, BodyKind::Hub { .. } | BodyKind::Ball) {
+                    continue;
+                }
+                let mut specialized = body.clone();
+                let mut reference = body.clone();
+                specialized.project_corotated_shape();
+                reference.project_corotated_shape_reference();
+                for (specialized, reference) in
+                    specialized.positions.iter().zip(reference.positions)
+                {
+                    maximum_error = maximum_error.max((*specialized - reference).length());
+                }
+            }
+            assert!(
+                maximum_error < 2.0e-15,
+                "{} specialized center projection error: {maximum_error}",
+                scene.title()
+            );
+        }
     }
 
     #[test]
