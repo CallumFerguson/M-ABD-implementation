@@ -32,12 +32,14 @@ and reset the simulation.
 
 Each affine body is represented by the four control points from Section 4.1.
 Each fixed step performs an implicit prediction and a compact co-rotated
-local/global solve, using a matrix-free dual KKT solve for all linear ball-joint
-constraints. Primitive sphere/capsule contacts provide two-way interaction with
-the cylinder and falling balls. The default timestep is the Figure 12 value of
-`1/30 s`; the on-screen controls can change it up to `1/500 s` at runtime. A
-compact overlay reports the active scene, smoothed FPS and frame time, measured
-simulation-step duration, fixed rate, grid dimensions, and scene size.
+local/global solve. The ball-joint system is solved exactly in independent hub
+blocks by exploiting the orthogonal rod-end attachments and shared hub-center
+attachments, rather than iterating over a generic constraint matrix. Primitive
+sphere/capsule contacts provide two-way interaction with the cylinder and
+falling balls. The default timestep is the Figure 12 value of `1/30 s`; the
+on-screen controls can change it up to `1/500 s` at runtime. A compact overlay
+reports the active scene, smoothed FPS and frame time, measured simulation-step
+duration, fixed rate, grid dimensions, and scene size.
 
 The PhysX versions manually recreate all three setups with rigid sphere and box
 actors connected by spherical joints, plus a static capsule for the cylinder

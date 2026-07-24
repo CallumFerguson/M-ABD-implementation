@@ -18,8 +18,6 @@ const FIXED_HZ_OPTIONS: [f64; 5] = [30.0, 60.0, 120.0, 200.0, 500.0];
 const GRAVITY: DVec3 = DVec3::new(0.0, -9.81, 0.0);
 const VELOCITY_DAMPING_AT_DEFAULT_HZ: f64 = 0.997;
 const AFFINE_STIFFNESS: f64 = 12_000.0;
-const DUAL_TOLERANCE: f64 = 1.0e-7;
-const MAX_PCG_ITERATIONS: usize = 100;
 const COROTATED_ITERATIONS: usize = 24;
 const CONTACT_PASSES: usize = 2;
 const DEMO_COUNT: usize = 3;
@@ -252,11 +250,12 @@ struct NetSimulation {
 struct SolverScratch {
     constraint_residual: Vec<DVec3>,
     solution: Vec<DVec3>,
-    preconditioned: Vec<DVec3>,
-    direction: Vec<DVec3>,
-    matrix_direction: Vec<DVec3>,
     body_forces: Vec<[DVec3; 4]>,
-    joint_diagonal: Vec<f64>,
+    joint_rod_inverse_weight: Vec<f64>,
+    hub_coupling: Vec<f64>,
+    hub_inverse_rod_weight_sum: Vec<f64>,
+    hub_weighted_residual: Vec<DVec3>,
+    hub_schur_factor: Vec<f64>,
 }
 
 impl SolverScratch {
@@ -264,11 +263,12 @@ impl SolverScratch {
         Self {
             constraint_residual: vec![DVec3::ZERO; joint_count],
             solution: vec![DVec3::ZERO; joint_count],
-            preconditioned: vec![DVec3::ZERO; joint_count],
-            direction: vec![DVec3::ZERO; joint_count],
-            matrix_direction: vec![DVec3::ZERO; joint_count],
             body_forces: vec![[DVec3::ZERO; 4]; body_count],
-            joint_diagonal: vec![0.0; joint_count],
+            joint_rod_inverse_weight: vec![0.0; joint_count],
+            hub_coupling: vec![0.0; body_count],
+            hub_inverse_rod_weight_sum: vec![0.0; body_count],
+            hub_weighted_residual: vec![DVec3::ZERO; body_count],
+            hub_schur_factor: vec![0.0; body_count],
         }
     }
 }
@@ -389,6 +389,7 @@ impl NetSimulation {
             }
         }
 
+        debug_validate_direct_solver_topology(&bodies, &joints);
         let solver_scratch = SolverScratch::new(bodies.len(), joints.len());
 
         Self {
@@ -407,16 +408,7 @@ impl NetSimulation {
             body.predict(dt);
         }
 
-        for (diagonal, joint) in self
-            .solver_scratch
-            .joint_diagonal
-            .iter_mut()
-            .zip(&self.joints)
-        {
-            *diagonal = (attachment_inverse_weight(&self.bodies, joint.a)
-                + attachment_inverse_weight(&self.bodies, joint.b))
-            .max(1.0e-16);
-        }
+        prepare_direct_joint_solver(&self.bodies, &self.joints, &mut self.solver_scratch);
 
         for _ in 0..COROTATED_ITERATIONS {
             for body in &mut self.bodies {
@@ -433,7 +425,7 @@ impl NetSimulation {
                     - attachment_position(&self.bodies, joint.b);
             }
 
-            solve_dual_pcg(&self.bodies, &self.joints, &mut self.solver_scratch);
+            solve_dual_direct(&self.joints, &mut self.solver_scratch);
             apply_joint_correction(
                 &mut self.bodies,
                 &self.joints,
@@ -1326,63 +1318,93 @@ fn safe_normal(primary: DVec3, secondary: DVec3, fallback: DVec3) -> DVec3 {
     }
 }
 
-fn solve_dual_pcg(bodies: &[AffineBody], joints: &[BallJoint], scratch: &mut SolverScratch) {
-    let SolverScratch {
-        constraint_residual: residual,
-        solution,
-        preconditioned,
-        direction,
-        matrix_direction,
-        body_forces,
-        joint_diagonal,
-    } = scratch;
+fn prepare_direct_joint_solver(
+    bodies: &[AffineBody],
+    joints: &[BallJoint],
+    scratch: &mut SolverScratch,
+) {
+    scratch.hub_coupling.fill(0.0);
 
-    solution.fill(DVec3::ZERO);
+    for (index, joint) in joints.iter().enumerate() {
+        scratch.joint_rod_inverse_weight[index] =
+            attachment_inverse_weight(bodies, joint.a).recip();
+        scratch.hub_coupling[joint.b.body] = attachment_inverse_weight(bodies, joint.b);
+    }
+}
 
-    for index in 0..joints.len() {
-        preconditioned[index] = residual[index] / joint_diagonal[index];
-        direction[index] = preconditioned[index];
+#[cfg(debug_assertions)]
+fn debug_validate_direct_solver_topology(bodies: &[AffineBody], joints: &[BallJoint]) {
+    let mut rod_endpoint_counts = vec![[0_u8; 2]; bodies.len()];
+
+    for joint in joints {
+        debug_assert!(
+            matches!(bodies[joint.a.body].kind, BodyKind::Rod) && !bodies[joint.a.body].fixed
+        );
+        debug_assert!(matches!(bodies[joint.b.body].kind, BodyKind::Hub { .. }));
+        debug_assert_eq!(joint.b.weights, HUB_CENTER);
+
+        let endpoint = if joint.a.weights == ROD_START {
+            0
+        } else {
+            debug_assert_eq!(joint.a.weights, ROD_END);
+            1
+        };
+        rod_endpoint_counts[joint.a.body][endpoint] += 1;
     }
 
-    let initial_norm = vector_dot(&residual, &residual).sqrt();
-    if initial_norm <= 1.0e-12 {
-        return;
-    }
-
-    let mut residual_dot_preconditioned = vector_dot(&residual, &preconditioned);
-
-    for _ in 0..MAX_PCG_ITERATIONS {
-        apply_dual_matrix(bodies, joints, &direction, matrix_direction, body_forces);
-
-        let denominator = vector_dot(&direction, &matrix_direction);
-        if denominator.abs() <= 1.0e-20 {
-            break;
-        }
-
-        let alpha = residual_dot_preconditioned / denominator;
-        for index in 0..joints.len() {
-            solution[index] += direction[index] * alpha;
-            residual[index] -= matrix_direction[index] * alpha;
-        }
-
-        if vector_dot(&residual, &residual).sqrt() <= DUAL_TOLERANCE * initial_norm {
-            break;
-        }
-
-        for index in 0..joints.len() {
-            preconditioned[index] = residual[index] / joint_diagonal[index];
-        }
-
-        let next_residual_dot_preconditioned = vector_dot(&residual, &preconditioned);
-        let beta = next_residual_dot_preconditioned / residual_dot_preconditioned;
-        residual_dot_preconditioned = next_residual_dot_preconditioned;
-
-        for index in 0..joints.len() {
-            direction[index] = preconditioned[index] + direction[index] * beta;
+    debug_assert_eq!(
+        ROD_START
+            .iter()
+            .zip(ROD_END)
+            .map(|(start, end)| start * end)
+            .sum::<f64>(),
+        0.0
+    );
+    for (index, body) in bodies.iter().enumerate() {
+        if matches!(body.kind, BodyKind::Rod) {
+            debug_assert_eq!(rod_endpoint_counts[index], [1, 1]);
         }
     }
 }
 
+#[cfg(not(debug_assertions))]
+fn debug_validate_direct_solver_topology(_bodies: &[AffineBody], _joints: &[BallJoint]) {}
+
+fn solve_dual_direct(joints: &[BallJoint], scratch: &mut SolverScratch) {
+    let SolverScratch {
+        constraint_residual: residual,
+        solution,
+        joint_rod_inverse_weight,
+        hub_coupling,
+        hub_inverse_rod_weight_sum,
+        hub_weighted_residual,
+        hub_schur_factor,
+        ..
+    } = scratch;
+
+    hub_inverse_rod_weight_sum.fill(0.0);
+    hub_weighted_residual.fill(DVec3::ZERO);
+
+    for (index, joint) in joints.iter().enumerate() {
+        let hub = joint.b.body;
+        let inverse_rod_weight = joint_rod_inverse_weight[index];
+        hub_inverse_rod_weight_sum[hub] += inverse_rod_weight;
+        hub_weighted_residual[hub] += residual[index] * inverse_rod_weight;
+    }
+
+    for index in 0..hub_schur_factor.len() {
+        let coupling = hub_coupling[index];
+        hub_schur_factor[index] = coupling / (1.0 + coupling * hub_inverse_rod_weight_sum[index]);
+    }
+
+    for (index, joint) in joints.iter().enumerate() {
+        let hub = joint.b.body;
+        solution[index] = (residual[index] - hub_weighted_residual[hub] * hub_schur_factor[hub])
+            * joint_rod_inverse_weight[index];
+    }
+}
+
+#[cfg(test)]
 fn apply_dual_matrix(
     bodies: &[AffineBody],
     joints: &[BallJoint],
@@ -1464,10 +1486,6 @@ fn accumulate_attachment(points: &mut [DVec3; 4], weights: [f64; 4], value: DVec
     for index in 0..4 {
         points[index] += value * weights[index];
     }
-}
-
-fn vector_dot(a: &[DVec3], b: &[DVec3]) -> f64 {
-    a.iter().zip(b).map(|(left, right)| left.dot(*right)).sum()
 }
 
 fn hub_rest_points() -> [DVec3; 4] {
@@ -1599,6 +1617,65 @@ mod tests {
             STEP_TIME_MEASURED_STEPS,
             STEP_TIME_WARMUP_STEPS,
         );
+    }
+
+    #[test]
+    fn direct_dual_solver_satisfies_the_constraint_matrix() {
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut simulation = NetSimulation::new(scene);
+            for body in &mut simulation.bodies {
+                body.predict(1.0 / DEFAULT_FIXED_HZ);
+            }
+            prepare_direct_joint_solver(
+                &simulation.bodies,
+                &simulation.joints,
+                &mut simulation.solver_scratch,
+            );
+
+            for (index, residual) in simulation
+                .solver_scratch
+                .constraint_residual
+                .iter_mut()
+                .enumerate()
+            {
+                let x = ((index * 17) % 29) as f64 - 14.0;
+                let y = ((index * 31) % 37) as f64 - 18.0;
+                let z = ((index * 43) % 47) as f64 - 23.0;
+                *residual = DVec3::new(x, y, z) * 0.01;
+            }
+            let expected = simulation.solver_scratch.constraint_residual.clone();
+
+            solve_dual_direct(&simulation.joints, &mut simulation.solver_scratch);
+
+            let mut actual = vec![DVec3::ZERO; simulation.joints.len()];
+            let mut body_forces = vec![[DVec3::ZERO; 4]; simulation.bodies.len()];
+            apply_dual_matrix(
+                &simulation.bodies,
+                &simulation.joints,
+                &simulation.solver_scratch.solution,
+                &mut actual,
+                &mut body_forces,
+            );
+
+            let maximum_error = actual
+                .iter()
+                .zip(&expected)
+                .map(|(actual, expected)| (*actual - *expected).length())
+                .fold(0.0_f64, f64::max);
+            let maximum_magnitude = expected
+                .iter()
+                .map(|value| value.length())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                maximum_error <= 1.0e-12 * (1.0 + maximum_magnitude),
+                "{} direct solve residual: {maximum_error}",
+                scene.title()
+            );
+        }
     }
 
     #[test]
