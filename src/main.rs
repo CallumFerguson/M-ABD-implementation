@@ -26,6 +26,8 @@ const CONTACT_PASSES: usize = 2;
 const DEMO_COUNT: usize = 3;
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_PROJECTION_BODY_THRESHOLD: usize = 4_000;
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_CYLINDER_BODY_THRESHOLD: usize = 4_000;
 const CONTACT_PROXY_CHUNK_SIZE: usize = 32;
 
 const HUB_RADIUS: f32 = 0.075;
@@ -502,16 +504,16 @@ impl NetSimulation {
                 self.grid_size * self.grid_size,
             );
 
-            for _ in 0..CONTACT_PASSES {
-                match self.scene {
-                    DemoScene::JointGrid => {}
-                    DemoScene::CylinderDrape => {
-                        project_cylinder_contacts(
-                            &mut self.bodies,
-                            self.cylinder.expect("cylinder scene must have a collider"),
-                        );
-                    }
-                    DemoScene::FallingBalls => {
+            match self.scene {
+                DemoScene::JointGrid => {}
+                DemoScene::CylinderDrape => {
+                    project_cylinder_contact_passes(
+                        &mut self.bodies,
+                        self.cylinder.expect("cylinder scene must have a collider"),
+                    );
+                }
+                DemoScene::FallingBalls => {
+                    for _ in 0..CONTACT_PASSES {
                         project_ball_contacts(
                             &mut self.bodies,
                             &self.ball_indices,
@@ -1210,6 +1212,32 @@ fn project_cylinder_contacts(bodies: &mut [AffineBody], cylinder: CylinderCollid
             }
             BodyKind::Ball => {}
         }
+    }
+}
+
+fn project_cylinder_contact_passes(bodies: &mut [AffineBody], cylinder: CylinderCollider) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if bodies.len() >= PARALLEL_CYLINDER_BODY_THRESHOLD
+        && let Some(task_pool) = ComputeTaskPool::try_get()
+    {
+        let task_count = task_pool.thread_num().saturating_mul(2).max(1);
+        if task_count > 1 {
+            let chunk_size = bodies.len().div_ceil(task_count);
+            task_pool.scope(|scope| {
+                for chunk in bodies.chunks_mut(chunk_size) {
+                    scope.spawn(async move {
+                        for _ in 0..CONTACT_PASSES {
+                            project_cylinder_contacts(chunk, cylinder);
+                        }
+                    });
+                }
+            });
+            return;
+        }
+    }
+
+    for _ in 0..CONTACT_PASSES {
+        project_cylinder_contacts(bodies, cylinder);
     }
 }
 
@@ -2576,6 +2604,30 @@ mod tests {
             maximum_error < 1.0e-12,
             "specialized cylinder projection error: {maximum_error}"
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parallel_cylinder_passes_match_sequential_body_order() {
+        simulation_task_pool_options().create_default_pools();
+
+        let mut simulation =
+            NetSimulation::with_grid_size(DemoScene::CylinderDrape, GRID_SIZE_OPTIONS[2]);
+        for _ in 0..20 {
+            simulation.step(1.0 / DEFAULT_FIXED_HZ);
+        }
+        let cylinder = simulation.cylinder.unwrap();
+        let mut parallel = simulation.bodies.clone();
+        let mut sequential = simulation.bodies;
+
+        project_cylinder_contact_passes(&mut parallel, cylinder);
+        for _ in 0..CONTACT_PASSES {
+            project_cylinder_contacts(&mut sequential, cylinder);
+        }
+
+        for (parallel, sequential) in parallel.iter().zip(sequential) {
+            assert_eq!(parallel.positions, sequential.positions);
+        }
     }
 
     #[test]
