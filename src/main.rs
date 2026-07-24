@@ -117,6 +117,7 @@ struct AffineBody {
     velocities: [DVec3; 4],
     mass_per_point: f64,
     stiffness: f64,
+    inertia: f64,
     inverse_diagonal: f64,
 }
 
@@ -145,6 +146,7 @@ impl AffineBody {
             velocities: [DVec3::ZERO; 4],
             mass_per_point: mass / 4.0,
             stiffness: AFFINE_STIFFNESS,
+            inertia: 0.0,
             inverse_diagonal: 0.0,
         }
     }
@@ -154,7 +156,13 @@ impl AffineBody {
     }
 
     fn rotation(&self) -> DMat3 {
-        let center = self.centroid();
+        match self.kind {
+            BodyKind::Rod => self.rotation_about(self.centroid()),
+            BodyKind::Hub { .. } | BodyKind::Ball => DMat3::IDENTITY,
+        }
+    }
+
+    fn rotation_about(&self, center: DVec3) -> DMat3 {
         let covariance = (0..4).fold(DMat3::ZERO, |sum, index| {
             sum + outer(self.positions[index] - center, self.rest_points[index])
         });
@@ -171,8 +179,8 @@ impl AffineBody {
             return;
         }
 
-        let inertia = self.mass_per_point / (dt * dt);
-        self.inverse_diagonal = 1.0 / (inertia + self.stiffness);
+        self.inertia = self.mass_per_point / (dt * dt);
+        self.inverse_diagonal = 1.0 / (self.inertia + self.stiffness);
 
         for index in 0..4 {
             self.predicted_positions[index] =
@@ -181,33 +189,34 @@ impl AffineBody {
         }
     }
 
-    fn project_corotated_shape(&mut self, dt: f64) {
+    fn project_corotated_shape(&mut self) {
         if self.fixed {
             return;
         }
 
-        let inertia = self.mass_per_point / (dt * dt);
         let center = self.centroid();
-        let rotation = self.rotation();
+        let rotation = match self.kind {
+            BodyKind::Rod => self.rotation_about(center),
+            BodyKind::Hub { .. } | BodyKind::Ball => DMat3::IDENTITY,
+        };
 
         for index in 0..4 {
             let rigid_target = center + rotation * self.rest_points[index];
-            self.positions[index] = (self.predicted_positions[index] * inertia
+            self.positions[index] = (self.predicted_positions[index] * self.inertia
                 + rigid_target * self.stiffness)
                 * self.inverse_diagonal;
         }
     }
 
-    fn finish_step(&mut self, dt: f64) {
+    fn finish_step(&mut self, velocity_scale: f64) {
         if self.fixed {
             self.velocities = [DVec3::ZERO; 4];
             return;
         }
 
-        let velocity_damping = velocity_damping_for_dt(dt);
         for index in 0..4 {
             self.velocities[index] =
-                (self.positions[index] - self.previous_positions[index]) * (velocity_damping / dt);
+                (self.positions[index] - self.previous_positions[index]) * velocity_scale;
         }
     }
 }
@@ -412,7 +421,7 @@ impl NetSimulation {
 
         for _ in 0..COROTATED_ITERATIONS {
             for body in &mut self.bodies {
-                body.project_corotated_shape(dt);
+                body.project_corotated_shape();
             }
 
             for (residual, joint) in self
@@ -449,8 +458,9 @@ impl NetSimulation {
             }
         }
 
+        let velocity_scale = velocity_damping_for_dt(dt) / dt;
         for body in &mut self.bodies {
-            body.finish_step(dt);
+            body.finish_step(velocity_scale);
         }
     }
 }
@@ -1673,6 +1683,47 @@ mod tests {
             assert!(
                 maximum_error <= 1.0e-12 * (1.0 + maximum_magnitude),
                 "{} direct solve residual: {maximum_error}",
+                scene.title()
+            );
+        }
+    }
+
+    #[test]
+    fn center_attached_bodies_remain_unrotated() {
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut simulation = NetSimulation::new(scene);
+            for _ in 0..150 {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let mut maximum_shape_error = 0.0_f64;
+            let mut maximum_velocity_spread = 0.0_f64;
+            for body in &simulation.bodies {
+                if !matches!(body.kind, BodyKind::Hub { .. } | BodyKind::Ball) {
+                    continue;
+                }
+
+                let center = body.centroid();
+                for index in 0..4 {
+                    maximum_shape_error = maximum_shape_error
+                        .max((body.positions[index] - center - body.rest_points[index]).length());
+                    maximum_velocity_spread = maximum_velocity_spread
+                        .max((body.velocities[index] - body.velocities[0]).length());
+                }
+            }
+
+            assert!(
+                maximum_shape_error < 1.0e-10,
+                "{} center-attached shape error: {maximum_shape_error}",
+                scene.title()
+            );
+            assert!(
+                maximum_velocity_spread < 1.0e-10,
+                "{} center-attached velocity spread: {maximum_velocity_spread}",
                 scene.title()
             );
         }
