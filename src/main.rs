@@ -115,8 +115,6 @@ struct AffineBody {
     previous_positions: [DVec3; 4],
     predicted_positions: [DVec3; 4],
     velocities: [DVec3; 4],
-    mass_per_point: f64,
-    stiffness: f64,
     inertia: f64,
     inverse_diagonal: f64,
 }
@@ -127,7 +125,6 @@ impl AffineBody {
         rest_points: [DVec3; 4],
         translation: DVec3,
         rotation: DQuat,
-        mass: f64,
         fixed: bool,
     ) -> Self {
         let positions = rest_points.map(|point| translation + rotation * point);
@@ -139,8 +136,6 @@ impl AffineBody {
             previous_positions: positions,
             predicted_positions: positions,
             velocities: [DVec3::ZERO; 4],
-            mass_per_point: mass / 4.0,
-            stiffness: AFFINE_STIFFNESS,
             inertia: 0.0,
             inverse_diagonal: 0.0,
         }
@@ -167,8 +162,8 @@ impl AffineBody {
             return;
         }
 
-        self.inertia = self.mass_per_point / (dt * dt);
-        self.inverse_diagonal = 1.0 / (self.inertia + self.stiffness);
+        self.inertia = body_mass_per_point(self.kind) / (dt * dt);
+        self.inverse_diagonal = 1.0 / (self.inertia + AFFINE_STIFFNESS);
 
         for index in 0..4 {
             self.predicted_positions[index] =
@@ -189,7 +184,7 @@ impl AffineBody {
 
         let center = self.centroid();
         let prediction_weight = self.inertia * self.inverse_diagonal;
-        let shape_weight = self.stiffness * self.inverse_diagonal;
+        let shape_weight = AFFINE_STIFFNESS * self.inverse_diagonal;
         match self.kind {
             BodyKind::Rod => {
                 let rotation = closest_rotation_with_iterations::<POLAR_ITERATIONS>(
@@ -233,7 +228,7 @@ impl AffineBody {
         for index in 0..4 {
             let rigid_target = center + rotation * rest_points[index];
             self.positions[index] = (self.predicted_positions[index] * self.inertia
-                + rigid_target * self.stiffness)
+                + rigid_target * AFFINE_STIFFNESS)
                 * self.inverse_diagonal;
         }
     }
@@ -363,7 +358,6 @@ impl NetSimulation {
                     hub_rest_points,
                     position,
                     DQuat::IDENTITY,
-                    0.18,
                     fixed,
                 ));
             }
@@ -422,7 +416,6 @@ impl NetSimulation {
                     ball_rest_points(),
                     position,
                     DQuat::IDENTITY,
-                    1.2,
                     false,
                 ));
             }
@@ -1084,7 +1077,6 @@ fn add_rod(
         rod_rest_points(),
         (start + end) * 0.5,
         rotation,
-        0.24,
         false,
     ));
 
@@ -1900,6 +1892,14 @@ fn body_rest_points(kind: BodyKind) -> [DVec3; 4] {
     }
 }
 
+fn body_mass_per_point(kind: BodyKind) -> f64 {
+    match kind {
+        BodyKind::Hub { .. } => 0.18 / 4.0,
+        BodyKind::Rod => 0.24 / 4.0,
+        BodyKind::Ball => 1.2 / 4.0,
+    }
+}
+
 fn hub_rest_points() -> [DVec3; 4] {
     let radius = HUB_RADIUS as f64;
     let scale = radius / 3.0_f64.sqrt();
@@ -2671,7 +2671,6 @@ mod tests {
                 rod_rest_points(),
                 DVec3::ZERO,
                 DQuat::IDENTITY,
-                1.0,
                 false,
             );
             rod.inverse_diagonal = 1.0;
@@ -2680,7 +2679,6 @@ mod tests {
                 ball_rest_points(),
                 sphere_position,
                 DQuat::IDENTITY,
-                1.0,
                 false,
             );
             ball.inverse_diagonal = 1.0;
@@ -2704,7 +2702,6 @@ mod tests {
                     ball_rest_points(),
                     DVec3::ZERO,
                     DQuat::IDENTITY,
-                    1.0,
                     false,
                 );
                 body.inverse_diagonal = 1.0;
@@ -2798,7 +2795,6 @@ mod tests {
             hub_rest_points(),
             position,
             DQuat::IDENTITY,
-            1.0,
             fixed,
         );
         body.inverse_diagonal = if fixed { 0.0 } else { 1.0 };
