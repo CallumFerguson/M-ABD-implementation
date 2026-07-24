@@ -184,20 +184,26 @@ impl AffineBody {
         }
 
         let center = self.centroid();
+        let prediction_weight = self.inertia * self.inverse_diagonal;
+        let shape_weight = self.stiffness * self.inverse_diagonal;
         match self.kind {
             BodyKind::Rod => {
                 let rotation = closest_rotation(rod_deformation_gradient(&self.positions));
+                let half_length = GRID_SPACING * 0.5;
+                let radius = ROD_THICKNESS as f64 * 0.5;
+                let x = rotation.x_axis * half_length;
+                let y = rotation.y_axis * radius;
+                let z = rotation.z_axis * radius;
+                let rigid_offsets = [-x - y - z, -x + y + z, x - y + z, x + y - z];
                 for index in 0..4 {
-                    let rigid_target = center + rotation * self.rest_points[index];
-                    self.positions[index] = (self.predicted_positions[index] * self.inertia
-                        + rigid_target * self.stiffness)
-                        * self.inverse_diagonal;
+                    let rigid_target = center + rigid_offsets[index];
+                    self.positions[index] = self.predicted_positions[index] * prediction_weight
+                        + rigid_target * shape_weight;
                 }
             }
             BodyKind::Hub { .. } | BodyKind::Ball => {
                 let predicted_center = centroid(&self.predicted_positions);
-                let projected_center = (predicted_center * self.inertia + center * self.stiffness)
-                    * self.inverse_diagonal;
+                let projected_center = predicted_center * prediction_weight + center * shape_weight;
                 for index in 0..4 {
                     self.positions[index] = projected_center + self.rest_points[index];
                 }
@@ -276,7 +282,6 @@ struct SolverScratch {
     constraint_residual: Vec<DVec3>,
     solution: Vec<DVec3>,
     joint_rod_inverse_weight: Vec<f64>,
-    hub_coupling: Vec<f64>,
     hub_inverse_rod_weight_sum: Vec<f64>,
     hub_weighted_residual: Vec<DVec3>,
     hub_schur_factor: Vec<f64>,
@@ -290,7 +295,6 @@ impl SolverScratch {
             constraint_residual: vec![DVec3::ZERO; joint_count],
             solution: vec![DVec3::ZERO; joint_count],
             joint_rod_inverse_weight: vec![0.0; joint_count],
-            hub_coupling: vec![0.0; body_count],
             hub_inverse_rod_weight_sum: vec![0.0; body_count],
             hub_weighted_residual: vec![DVec3::ZERO; body_count],
             hub_schur_factor: vec![0.0; body_count],
@@ -1598,12 +1602,17 @@ fn prepare_direct_joint_solver(
     joints: &[BallJoint],
     scratch: &mut SolverScratch,
 ) {
-    scratch.hub_coupling.fill(0.0);
+    scratch.hub_inverse_rod_weight_sum.fill(0.0);
 
     for (index, joint) in joints.iter().enumerate() {
-        scratch.joint_rod_inverse_weight[index] =
-            (bodies[joint.a.body].inverse_diagonal * 0.5).recip();
-        scratch.hub_coupling[joint.b.body] = bodies[joint.b.body].inverse_diagonal * 0.25;
+        let inverse_rod_weight = (bodies[joint.a.body].inverse_diagonal * 0.5).recip();
+        scratch.joint_rod_inverse_weight[index] = inverse_rod_weight;
+        scratch.hub_inverse_rod_weight_sum[joint.b.body] += inverse_rod_weight;
+    }
+
+    for (index, factor) in scratch.hub_schur_factor.iter_mut().enumerate() {
+        let coupling = bodies[index].inverse_diagonal * 0.25;
+        *factor = coupling / (1.0 + coupling * scratch.hub_inverse_rod_weight_sum[index]);
     }
 }
 
@@ -1676,26 +1685,17 @@ fn solve_dual_direct(joints: &[BallJoint], scratch: &mut SolverScratch) {
         constraint_residual: residual,
         solution,
         joint_rod_inverse_weight,
-        hub_coupling,
-        hub_inverse_rod_weight_sum,
         hub_weighted_residual,
         hub_schur_factor,
         ..
     } = scratch;
 
-    hub_inverse_rod_weight_sum.fill(0.0);
     hub_weighted_residual.fill(DVec3::ZERO);
 
     for (index, joint) in joints.iter().enumerate() {
         let hub = joint.b.body;
         let inverse_rod_weight = joint_rod_inverse_weight[index];
-        hub_inverse_rod_weight_sum[hub] += inverse_rod_weight;
         hub_weighted_residual[hub] += residual[index] * inverse_rod_weight;
-    }
-
-    for index in 0..hub_schur_factor.len() {
-        let coupling = hub_coupling[index];
-        hub_schur_factor[index] = coupling / (1.0 + coupling * hub_inverse_rod_weight_sum[index]);
     }
 
     for (index, joint) in joints.iter().enumerate() {
@@ -1899,9 +1899,7 @@ fn closest_rotation(matrix: DMat3) -> DMat3 {
 mod tests {
     use super::*;
 
-    const STEP_TIME_BATCHES: usize = 7;
-    const STEP_TIME_WARMUP_STEPS: usize = 20;
-    const STEP_TIME_MEASURED_STEPS: usize = 10;
+    const STEP_TIME_GRID_ENV: &str = "STEP_TIME_GRID_SIZE";
 
     #[test]
     #[ignore = "performance check; run `cargo bench-scenes`"]
@@ -1980,20 +1978,34 @@ mod tests {
 
     fn report_step_time(scene: DemoScene) {
         let dt = 1.0 / DEFAULT_FIXED_HZ;
-        let mut samples = Vec::with_capacity(STEP_TIME_BATCHES);
+        let grid_size = std::env::var(STEP_TIME_GRID_ENV)
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| panic!("{STEP_TIME_GRID_ENV} must be an integer"))
+            })
+            .unwrap_or(DEFAULT_GRID_SIZE);
+        assert!(grid_size >= 2, "benchmark grid must be at least 2x2");
+        let (batches, warmup_steps, measured_steps) = match grid_size {
+            2..=10 => (7, 20, 10),
+            11..=25 => (5, 8, 5),
+            26..=50 => (5, 4, 3),
+            _ => (3, 2, 2),
+        };
+        let mut samples = Vec::with_capacity(batches);
 
-        for _ in 0..STEP_TIME_BATCHES {
-            let mut simulation = NetSimulation::new(scene);
-            for _ in 0..STEP_TIME_WARMUP_STEPS {
+        for _ in 0..batches {
+            let mut simulation = NetSimulation::with_grid_size(scene, grid_size);
+            for _ in 0..warmup_steps {
                 simulation.step(dt);
             }
 
             let start = Instant::now();
-            for _ in 0..STEP_TIME_MEASURED_STEPS {
+            for _ in 0..measured_steps {
                 simulation.step(dt);
             }
-            let ms_per_step =
-                start.elapsed().as_secs_f64() * 1_000.0 / STEP_TIME_MEASURED_STEPS as f64;
+            let ms_per_step = start.elapsed().as_secs_f64() * 1_000.0 / measured_steps as f64;
 
             let _ = std::hint::black_box(&simulation);
             assert!(simulation_is_finite(&simulation));
@@ -2010,10 +2022,10 @@ mod tests {
             scene.title(),
             samples[0],
             samples[samples.len() - 1],
-            DEFAULT_GRID_SIZE,
-            STEP_TIME_BATCHES,
-            STEP_TIME_MEASURED_STEPS,
-            STEP_TIME_WARMUP_STEPS,
+            grid_size,
+            batches,
+            measured_steps,
+            warmup_steps,
         );
     }
 
@@ -2216,7 +2228,7 @@ mod tests {
     }
 
     #[test]
-    fn specialized_center_projection_matches_generic_shape_projection() {
+    fn weighted_shape_projection_matches_reference() {
         for scene in [
             DemoScene::JointGrid,
             DemoScene::CylinderDrape,
@@ -2229,9 +2241,6 @@ mod tests {
 
             let mut maximum_error = 0.0_f64;
             for body in &simulation.bodies {
-                if !matches!(body.kind, BodyKind::Hub { .. } | BodyKind::Ball) {
-                    continue;
-                }
                 let mut specialized = body.clone();
                 let mut reference = body.clone();
                 specialized.project_corotated_shape();
@@ -2244,7 +2253,7 @@ mod tests {
             }
             assert!(
                 maximum_error < 2.0e-15,
-                "{} specialized center projection error: {maximum_error}",
+                "{} weighted shape projection error: {maximum_error}",
                 scene.title()
             );
         }

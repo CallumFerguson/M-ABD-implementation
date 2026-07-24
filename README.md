@@ -72,12 +72,25 @@ with C++** workload.
 ## Compare simulation step time
 
 The three opt-in performance tests exercise the same project-solver `step`
-work measured by the on-screen `SIM STEP` value. Each test uses a fresh 10x10
-scene, advances 20 untimed warm-up steps so contacts are active, and reports the
-median milliseconds per step from seven short batches. Run all three with:
+work measured by the on-screen `SIM STEP` value. By default each test uses a
+fresh 10x10 scene, advances 20 untimed warm-up steps so contacts are active,
+and reports the median milliseconds per step from seven short batches. Run all
+three with:
 
 ```sh
 cargo bench-scenes
+```
+
+Set `STEP_TIME_GRID_SIZE` to benchmark a larger grid. The harness automatically
+uses fewer samples as the grid grows, keeping even the 100x100 check short:
+
+```powershell
+$env:STEP_TIME_GRID_SIZE = 100
+cargo bench-scenes
+```
+
+```sh
+STEP_TIME_GRID_SIZE=100 cargo bench-scenes
 ```
 
 Filter to one scene when needed, for example:
@@ -95,6 +108,14 @@ Windows:
 .\scripts\compare-step-times.cmd -SaveBaseline
 # Make the optimization, then compare all three scenes.
 .\scripts\compare-step-times.cmd
+```
+
+Pass `-GridSize 25`, `50`, or `100` to save and compare a size-specific
+baseline. Each size gets its own default baseline file:
+
+```powershell
+.\scripts\compare-step-times.cmd -GridSize 100 -SaveBaseline
+.\scripts\compare-step-times.cmd -GridSize 100
 ```
 
 Negative percentages in the comparison are faster. Changes inside the default

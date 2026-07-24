@@ -1,5 +1,7 @@
 param(
     [switch]$SaveBaseline,
+    [ValidateSet(10, 25, 50, 100)]
+    [int]$GridSize = 10,
     [string]$BaselinePath = ".step-time-baseline.json",
     [ValidateRange(0.0, 100.0)]
     [double]$NoiseThresholdPercent = 2.0
@@ -7,12 +9,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
+if ($BaselinePath -eq ".step-time-baseline.json" -and $GridSize -ne 10) {
+    $BaselinePath = ".step-time-baseline-$GridSize.json"
+}
 if (-not [System.IO.Path]::IsPathRooted($BaselinePath)) {
     $BaselinePath = Join-Path $repoRoot $BaselinePath
 }
 
 Push-Location $repoRoot
+$previousGridSize = $env:STEP_TIME_GRID_SIZE
 try {
+    $env:STEP_TIME_GRID_SIZE = $GridSize.ToString(
+        [System.Globalization.CultureInfo]::InvariantCulture
+    )
     # Windows PowerShell promotes native stderr to ErrorRecord objects. Cargo
     # writes normal progress there, so keep it capturable without terminating.
     $previousErrorActionPreference = $ErrorActionPreference
@@ -24,6 +33,11 @@ try {
         $ErrorActionPreference = $previousErrorActionPreference
     }
 } finally {
+    if ($null -eq $previousGridSize) {
+        Remove-Item Env:STEP_TIME_GRID_SIZE -ErrorAction SilentlyContinue
+    } else {
+        $env:STEP_TIME_GRID_SIZE = $previousGridSize
+    }
     Pop-Location
 }
 
