@@ -8,7 +8,7 @@ use bevy::window::{PresentMode, WindowResolution};
 
 mod physx_demo;
 
-use physx_demo::PhysxDemo;
+use physx_demo::{PHYSX_AVAILABLE, PhysxDemo};
 
 const DEFAULT_GRID_SIZE: usize = 10;
 const GRID_SIZE_OPTIONS: [usize; 4] = [10, 25, 50, 100];
@@ -83,6 +83,10 @@ enum SimulationBackend {
 
 impl SimulationBackend {
     fn toggled(self) -> Self {
+        if !PHYSX_AVAILABLE {
+            return Self::Project;
+        }
+
         match self {
             Self::Project => Self::Physx,
             Self::Physx => Self::Project,
@@ -496,6 +500,11 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let backend_hint = if PHYSX_AVAILABLE {
+        "[B] Backend"
+    } else {
+        "PhysX disabled"
+    };
     let assets = VisualAssets {
         hub_mesh: meshes.add(Sphere::new(HUB_RADIUS)),
         rod_mesh: meshes.add(Cuboid::new(
@@ -558,7 +567,7 @@ fn setup_scene(
 
     commands.spawn((
         Text::new(format!(
-            "SCENE 1/{DEMO_COUNT}  Joint grid\nBACKEND  PROJECT\nGRID     {DEFAULT_GRID_SIZE}x{DEFAULT_GRID_SIZE}\nFPS       --\nFRAME     -- ms\nSIM STEP  -- ms\nFIXED    {DEFAULT_FIXED_HZ:>5.0} Hz\n280 bodies | 360 joints\n[1] Grid  [2] Cylinder  [3] Balls  [B] Backend  [R] Reset"
+            "SCENE 1/{DEMO_COUNT}  Joint grid\nBACKEND  PROJECT\nGRID     {DEFAULT_GRID_SIZE}x{DEFAULT_GRID_SIZE}\nFPS       --\nFRAME     -- ms\nSIM STEP  -- ms\nFIXED    {DEFAULT_FIXED_HZ:>5.0} Hz\n280 bodies | 360 joints\n[1] Grid  [2] Cylinder  [3] Balls  {backend_hint}  [R] Reset"
         )),
         TextFont {
             font_size: FontSize::Px(15.0),
@@ -740,7 +749,7 @@ fn switch_demo_scene(
         (DemoScene::CylinderDrape, active.backend, active.grid_size)
     } else if keys.just_pressed(KeyCode::Digit3) {
         (DemoScene::FallingBalls, active.backend, active.grid_size)
-    } else if keys.just_pressed(KeyCode::KeyB) {
+    } else if keys.just_pressed(KeyCode::KeyB) && PHYSX_AVAILABLE {
         (active.scene, active.backend.toggled(), active.grid_size)
     } else if keys.just_pressed(KeyCode::KeyR) {
         (active.scene, active.backend, active.grid_size)
@@ -940,10 +949,15 @@ fn update_performance_overlay(
         SimulationBackend::Project => "PROJECT".to_owned(),
         SimulationBackend::Physx => format!("PHYSX {}", physx.status()),
     };
+    let backend_hint = if PHYSX_AVAILABLE {
+        "[B] Backend"
+    } else {
+        "PhysX disabled"
+    };
 
     for mut text in &mut overlays {
         text.0 = format!(
-            "SCENE {}/{}  {}\nBACKEND  {backend}\nGRID     {}x{}\nFPS      {fps}\nFRAME    {frame_time} ms\nSIM STEP {:>5.2} ms\nFIXED    {fixed_hz:>5.0} Hz\n{} bodies | {} joints\n[1] Grid  [2] Cylinder  [3] Balls  [B] Backend  [R] Reset",
+            "SCENE {}/{}  {}\nBACKEND  {backend}\nGRID     {}x{}\nFPS      {fps}\nFRAME    {frame_time} ms\nSIM STEP {:>5.2} ms\nFIXED    {fixed_hz:>5.0} Hz\n{} bodies | {} joints\n[1] Grid  [2] Cylinder  [3] Balls  {backend_hint}  [R] Reset",
             active.scene.number(),
             DEMO_COUNT,
             active.scene.title(),
@@ -1486,6 +1500,67 @@ fn closest_rotation(matrix: DMat3) -> DMat3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STEP_TIME_BATCHES: usize = 7;
+    const STEP_TIME_WARMUP_STEPS: usize = 20;
+    const STEP_TIME_MEASURED_STEPS: usize = 10;
+
+    #[test]
+    #[ignore = "performance check; run `cargo bench-scenes`"]
+    fn step_time_scene_1_joint_grid() {
+        report_step_time(DemoScene::JointGrid);
+    }
+
+    #[test]
+    #[ignore = "performance check; run `cargo bench-scenes`"]
+    fn step_time_scene_2_cylinder_drape() {
+        report_step_time(DemoScene::CylinderDrape);
+    }
+
+    #[test]
+    #[ignore = "performance check; run `cargo bench-scenes`"]
+    fn step_time_scene_3_falling_balls() {
+        report_step_time(DemoScene::FallingBalls);
+    }
+
+    fn report_step_time(scene: DemoScene) {
+        let dt = 1.0 / DEFAULT_FIXED_HZ;
+        let mut samples = Vec::with_capacity(STEP_TIME_BATCHES);
+
+        for _ in 0..STEP_TIME_BATCHES {
+            let mut simulation = NetSimulation::new(scene);
+            for _ in 0..STEP_TIME_WARMUP_STEPS {
+                simulation.step(dt);
+            }
+
+            let start = Instant::now();
+            for _ in 0..STEP_TIME_MEASURED_STEPS {
+                simulation.step(dt);
+            }
+            let ms_per_step =
+                start.elapsed().as_secs_f64() * 1_000.0 / STEP_TIME_MEASURED_STEPS as f64;
+
+            let _ = std::hint::black_box(&simulation);
+            assert!(simulation_is_finite(&simulation));
+            samples.push(ms_per_step);
+        }
+
+        samples.sort_by(f64::total_cmp);
+        let median_ms = samples[samples.len() / 2];
+        let mean_ms = samples.iter().sum::<f64>() / samples.len() as f64;
+
+        println!(
+            "STEP_TIME scene={} name=\"{}\" median_ms={median_ms:.4} mean_ms={mean_ms:.4} min_ms={:.4} max_ms={:.4} grid={} batches={} measured_steps={} warmup_steps={} dt={dt:.6}",
+            scene.number(),
+            scene.title(),
+            samples[0],
+            samples[samples.len() - 1],
+            DEFAULT_GRID_SIZE,
+            STEP_TIME_BATCHES,
+            STEP_TIME_MEASURED_STEPS,
+            STEP_TIME_WARMUP_STEPS,
+        );
+    }
 
     #[test]
     fn builds_the_papers_10_by_10_topology() {

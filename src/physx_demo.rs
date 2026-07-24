@@ -1,9 +1,14 @@
-use bevy::prelude::{Quat, Transform};
+use bevy::prelude::Transform;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(target_arch = "wasm32", feature = "native-physx"))]
+use bevy::prelude::Quat;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-physx"))]
 use bevy::prelude::Vec3;
 
-#[cfg(not(target_arch = "wasm32"))]
+pub const PHYSX_AVAILABLE: bool = cfg!(any(target_arch = "wasm32", feature = "native-physx"));
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-physx"))]
 mod platform {
     use super::*;
     use crate::DemoScene;
@@ -597,6 +602,37 @@ mod platform {
                 assert_eq!(net_body_count(grid_size), expected_bodies);
                 assert_eq!(joint_count(grid_size), expected_joints);
             }
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native-physx")))]
+mod platform {
+    use super::*;
+    use crate::DemoScene;
+
+    /// Zero-cost native placeholder used by the fast development build.
+    pub struct PhysxDemo;
+
+    impl PhysxDemo {
+        pub fn new() -> Self {
+            Self
+        }
+
+        pub fn reset(&mut self, _scene: DemoScene, _grid_size: usize) {}
+
+        pub fn clear(&mut self) {}
+
+        pub fn step(&mut self, _dt: f32) {}
+
+        pub fn refresh_body_transforms(&mut self) {}
+
+        pub fn body_transforms(&self) -> &[Transform] {
+            &[]
+        }
+
+        pub fn status(&self) -> &'static str {
+            "DISABLED"
         }
     }
 }

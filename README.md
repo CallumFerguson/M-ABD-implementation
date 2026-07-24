@@ -4,14 +4,14 @@ A focused proof-of-concept implementation of the ball-joint nets from
 *M-ABD: Scalable, Efficient, and Robust Multi-Affine-Body Dynamics*.
 
 The application has three scenes that can be changed at runtime. Each scene can
-run either the project's M-ABD-inspired solver or an independently constructed
-PhysX version. Changing the scene, changing the backend, or resetting rebuilds
-the selected simulation from its initial state:
+run the project's M-ABD-inspired solver or, when the PhysX backend is enabled,
+an independently constructed PhysX version. Changing the scene, changing the
+backend, or resetting rebuilds the selected simulation from its initial state:
 
 - `1`: the original edge-pinned 10x10 joint grid
 - `2`: the edge-pinned joint grid draped over a static cylinder
 - `3`: a horizontal, four-corner-pinned joint grid catching three falling balls
-- `B`: switch between the project solver and PhysX
+- `B`: switch between the project solver and PhysX (when available)
 - `R`: reset the current scene
 - `10x10`, `25x25`, `50x50`, and `100x100` buttons: rebuild the current
   scene/backend with that grid size
@@ -50,13 +50,56 @@ while browser builds use the `physx-js-webidl` WebAssembly package (PhysX
 
 ## Run natively
 
-The first native build compiles the PhysX C++ SDK and therefore requires a C++
-toolchain. On Windows, use the MSVC Rust toolchain with Visual Studio Build
-Tools and the **Desktop development with C++** workload.
+The default native build includes only the project solver. This is the fast
+development configuration and avoids compiling the PhysX C++ SDK:
 
 ```sh
 cargo run
 ```
+
+Enable the native PhysX comparison explicitly when it is needed:
+
+```sh
+cargo run --features native-physx
+```
+
+The first PhysX-enabled build requires a C++ toolchain. On Windows, use the
+MSVC Rust toolchain with Visual Studio Build Tools and the **Desktop development
+with C++** workload.
+
+## Compare simulation step time
+
+The three opt-in performance tests exercise the same project-solver `step`
+work measured by the on-screen `SIM STEP` value. Each test uses a fresh 10x10
+scene, advances 20 untimed warm-up steps so contacts are active, and reports the
+median milliseconds per step from seven short batches. Run all three with:
+
+```sh
+cargo bench-scenes
+```
+
+Filter to one scene when needed, for example:
+
+```sh
+cargo test --no-default-features step_time_scene_2 -- --ignored --nocapture --test-threads=1
+```
+
+The run is intentionally short and serial. It does not compile or link PhysX,
+and it prints one machine-readable `STEP_TIME` line for each scene. To save a
+baseline before changing the solver and compare against it afterward on
+Windows:
+
+```powershell
+.\scripts\compare-step-times.cmd -SaveBaseline
+# Make the optimization, then compare all three scenes.
+.\scripts\compare-step-times.cmd
+```
+
+Negative percentages in the comparison are faster. Changes inside the default
+two-percent noise threshold are labeled `WITHIN NOISE`; the threshold can be
+changed with `-NoiseThresholdPercent`. Use the same machine, power mode, and
+background workload for both runs, and repeat small changes. The generated
+baseline file is local and ignored by Git.
 
 ## Run in a browser
 
