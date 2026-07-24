@@ -402,8 +402,6 @@ struct SolverScratch {
     hub_inverse_rod_weight_sum: Vec<f64>,
     hub_weighted_residual: Vec<DVec3>,
     hub_schur_factor: Vec<f64>,
-    contact_proxy_start: Vec<DVec3>,
-    contact_proxy_end: Vec<DVec3>,
     contact_chunk_min: Vec<DVec3>,
     contact_chunk_max: Vec<DVec3>,
 }
@@ -423,8 +421,6 @@ impl SolverScratch {
             hub_inverse_rod_weight_sum: vec![0.0; hub_count],
             hub_weighted_residual: vec![DVec3::ZERO; hub_count],
             hub_schur_factor: vec![0.0; hub_count],
-            contact_proxy_start: vec![DVec3::ZERO; body_count],
-            contact_proxy_end: vec![DVec3::ZERO; body_count],
             contact_chunk_min: vec![DVec3::ZERO; body_count.div_ceil(CONTACT_PROXY_CHUNK_SIZE)],
             contact_chunk_max: vec![DVec3::ZERO; body_count.div_ceil(CONTACT_PROXY_CHUNK_SIZE)],
         }
@@ -643,8 +639,6 @@ impl NetSimulation {
                     project_ball_contact_passes(
                         &mut self.bodies,
                         &self.ball_indices,
-                        &mut self.solver_scratch.contact_proxy_start,
-                        &mut self.solver_scratch.contact_proxy_end,
                         &mut self.solver_scratch.contact_chunk_min,
                         &mut self.solver_scratch.contact_chunk_max,
                     );
@@ -1477,31 +1471,15 @@ fn project_cylinder_contacts_reference(bodies: &mut [AffineBody], cylinder: Cyli
 fn project_ball_contact_passes(
     bodies: &mut [AffineBody],
     ball_indices: &[usize],
-    proxy_start: &mut [DVec3],
-    proxy_end: &mut [DVec3],
     chunk_min: &mut [DVec3],
     chunk_max: &mut [DVec3],
 ) {
     for pass in 0..CONTACT_PASSES {
         project_ball_pairs(bodies, ball_indices);
         if pass == 0 {
-            rebuild_ball_contact_cache(
-                bodies,
-                ball_indices,
-                proxy_start,
-                proxy_end,
-                chunk_min,
-                chunk_max,
-            );
+            rebuild_ball_contact_chunk_bounds(bodies, ball_indices, chunk_min, chunk_max);
         }
-        project_balls_against_cached_net(
-            bodies,
-            ball_indices,
-            proxy_start,
-            proxy_end,
-            chunk_min,
-            chunk_max,
-        );
+        project_balls_against_chunked_net(bodies, ball_indices, chunk_min, chunk_max);
     }
 }
 
@@ -1509,28 +1487,12 @@ fn project_ball_contact_passes(
 fn project_ball_contacts(
     bodies: &mut [AffineBody],
     ball_indices: &[usize],
-    proxy_start: &mut [DVec3],
-    proxy_end: &mut [DVec3],
     chunk_min: &mut [DVec3],
     chunk_max: &mut [DVec3],
 ) {
     project_ball_pairs(bodies, ball_indices);
-    rebuild_ball_contact_cache(
-        bodies,
-        ball_indices,
-        proxy_start,
-        proxy_end,
-        chunk_min,
-        chunk_max,
-    );
-    project_balls_against_cached_net(
-        bodies,
-        ball_indices,
-        proxy_start,
-        proxy_end,
-        chunk_min,
-        chunk_max,
-    );
+    rebuild_ball_contact_chunk_bounds(bodies, ball_indices, chunk_min, chunk_max);
+    project_balls_against_chunked_net(bodies, ball_indices, chunk_min, chunk_max);
 }
 
 fn project_ball_pairs(bodies: &mut [AffineBody], ball_indices: &[usize]) {
@@ -1554,11 +1516,9 @@ fn project_ball_pairs(bodies: &mut [AffineBody], ball_indices: &[usize]) {
     }
 }
 
-fn rebuild_ball_contact_cache(
+fn rebuild_ball_contact_chunk_bounds(
     bodies: &[AffineBody],
     ball_indices: &[usize],
-    proxy_start: &mut [DVec3],
-    proxy_end: &mut [DVec3],
     chunk_min: &mut [DVec3],
     chunk_max: &mut [DVec3],
 ) {
@@ -1570,24 +1530,18 @@ fn rebuild_ball_contact_cache(
         let mut minimum = DVec3::splat(f64::INFINITY);
         let mut maximum = DVec3::splat(f64::NEG_INFINITY);
         for body_index in first_body..end_body {
-            refresh_contact_proxy(bodies, body_index, proxy_start, proxy_end);
-            minimum = minimum
-                .min(proxy_start[body_index])
-                .min(proxy_end[body_index]);
-            maximum = maximum
-                .max(proxy_start[body_index])
-                .max(proxy_end[body_index]);
+            let (start, end) = broad_contact_proxy(&bodies[body_index]);
+            minimum = minimum.min(start).min(end);
+            maximum = maximum.max(start).max(end);
         }
         chunk_min[chunk_index] = minimum;
         chunk_max[chunk_index] = maximum;
     }
 }
 
-fn project_balls_against_cached_net(
+fn project_balls_against_chunked_net(
     bodies: &mut [AffineBody],
     ball_indices: &[usize],
-    proxy_start: &mut [DVec3],
-    proxy_end: &mut [DVec3],
     chunk_min: &mut [DVec3],
     chunk_max: &mut [DVec3],
 ) {
@@ -1614,6 +1568,8 @@ fn project_balls_against_cached_net(
             let first_body = chunk_index * CONTACT_PROXY_CHUNK_SIZE;
             let end_body = (first_body + CONTACT_PROXY_CHUNK_SIZE).min(net_body_count);
             for net_body_index in first_body..end_body {
+                let (start_position, end_position) =
+                    detailed_contact_proxy(&bodies[net_body_index]);
                 let contact_applied = match bodies[net_body_index].kind {
                     BodyKind::Hub { .. } => project_attachment_pair_at_positions(
                         bodies,
@@ -1623,14 +1579,12 @@ fn project_balls_against_cached_net(
                             weights: HUB_CENTER,
                         },
                         sphere_position,
-                        proxy_start[net_body_index],
+                        start_position,
                         chunk_margin,
                         DVec3::Y,
                     ),
                     BodyKind::Rod => {
                         let (start, end) = rod_collider_attachments(net_body_index);
-                        let start_position = proxy_start[net_body_index];
-                        let end_position = proxy_end[net_body_index];
                         let direction = end_position - start_position;
                         let minimum_distance = BALL_RADIUS as f64 + ROD_THICKNESS as f64 * 0.5;
                         if point_outside_capsule_bounds(
@@ -1665,13 +1619,12 @@ fn project_balls_against_cached_net(
 
                 if contact_applied {
                     sphere_position = attachment_position(bodies, ball_center);
-                    refresh_contact_proxy(bodies, net_body_index, proxy_start, proxy_end);
-                    chunk_min[chunk_index] = chunk_min[chunk_index]
-                        .min(proxy_start[net_body_index])
-                        .min(proxy_end[net_body_index]);
-                    chunk_max[chunk_index] = chunk_max[chunk_index]
-                        .max(proxy_start[net_body_index])
-                        .max(proxy_end[net_body_index]);
+                    let (updated_start, updated_end) =
+                        detailed_contact_proxy(&bodies[net_body_index]);
+                    chunk_min[chunk_index] =
+                        chunk_min[chunk_index].min(updated_start).min(updated_end);
+                    chunk_max[chunk_index] =
+                        chunk_max[chunk_index].max(updated_start).max(updated_end);
                 }
             }
         }
@@ -1708,33 +1661,74 @@ fn point_outside_capsule_bounds(
         || midpoint_delta.z > half_extents.z
 }
 
-fn refresh_contact_proxy(
-    bodies: &[AffineBody],
-    body_index: usize,
-    proxy_start: &mut [DVec3],
-    proxy_end: &mut [DVec3],
-) {
-    match bodies[body_index].kind {
+#[inline]
+fn broad_contact_proxy(body: &AffineBody) -> (DVec3, DVec3) {
+    match body.kind {
         BodyKind::Hub { .. } => {
-            let center = attachment_position(
-                bodies,
-                Attachment {
-                    body: body_index,
-                    weights: HUB_CENTER,
-                },
-            );
-            proxy_start[body_index] = center;
-            proxy_end[body_index] = center;
+            let center = hub_attachment_center(&body.positions);
+            (center, center)
         }
         BodyKind::Rod => {
-            let positions = &bodies[body_index].positions;
-            let joint_start = positions[0] * 0.5 + positions[1] * 0.5;
-            let joint_end = positions[2] * 0.5 + positions[3] * 0.5;
-            let trim_offset = (joint_end - joint_start) * ROD_COLLIDER_TRIM;
-            proxy_start[body_index] = joint_start + trim_offset;
-            proxy_end[body_index] = joint_end - trim_offset;
+            let [start, end] = rod_joint_endpoints(&body.positions);
+            (start, end)
         }
-        BodyKind::Ball => {}
+        BodyKind::Ball => unreachable!("balls follow all net bodies"),
+    }
+}
+
+#[inline]
+fn detailed_contact_proxy(body: &AffineBody) -> (DVec3, DVec3) {
+    match body.kind {
+        BodyKind::Hub { .. } => {
+            let center = hub_attachment_center(&body.positions);
+            (center, center)
+        }
+        BodyKind::Rod => {
+            let [joint_start, joint_end] = rod_joint_endpoints(&body.positions);
+            let trim_offset = (joint_end - joint_start) * ROD_COLLIDER_TRIM;
+            (joint_start + trim_offset, joint_end - trim_offset)
+        }
+        BodyKind::Ball => unreachable!("balls follow all net bodies"),
+    }
+}
+
+#[cfg(test)]
+fn rebuild_ball_contact_detailed_chunk_bounds(
+    bodies: &[AffineBody],
+    ball_indices: &[usize],
+    chunk_min: &mut [DVec3],
+    chunk_max: &mut [DVec3],
+) {
+    let net_body_count = ball_indices.first().copied().unwrap_or(bodies.len());
+    let chunk_count = net_body_count.div_ceil(CONTACT_PROXY_CHUNK_SIZE);
+    for chunk_index in 0..chunk_count {
+        let first_body = chunk_index * CONTACT_PROXY_CHUNK_SIZE;
+        let end_body = (first_body + CONTACT_PROXY_CHUNK_SIZE).min(net_body_count);
+        let mut minimum = DVec3::splat(f64::INFINITY);
+        let mut maximum = DVec3::splat(f64::NEG_INFINITY);
+        for body in &bodies[first_body..end_body] {
+            let (start, end) = detailed_contact_proxy(body);
+            minimum = minimum.min(start).min(end);
+            maximum = maximum.max(start).max(end);
+        }
+        chunk_min[chunk_index] = minimum;
+        chunk_max[chunk_index] = maximum;
+    }
+}
+
+#[cfg(test)]
+fn project_ball_contact_passes_detailed_bounds_reference(
+    bodies: &mut [AffineBody],
+    ball_indices: &[usize],
+    chunk_min: &mut [DVec3],
+    chunk_max: &mut [DVec3],
+) {
+    for pass in 0..CONTACT_PASSES {
+        project_ball_pairs(bodies, ball_indices);
+        if pass == 0 {
+            rebuild_ball_contact_detailed_chunk_bounds(bodies, ball_indices, chunk_min, chunk_max);
+        }
+        project_balls_against_chunked_net(bodies, ball_indices, chunk_min, chunk_max);
     }
 }
 
@@ -3483,19 +3477,10 @@ mod tests {
             let ball_indices = simulation.ball_indices.clone();
             let mut cached = simulation.bodies.clone();
             let mut uncached = simulation.bodies;
-            let mut proxy_start = vec![DVec3::ZERO; cached.len()];
-            let mut proxy_end = vec![DVec3::ZERO; cached.len()];
             let chunk_count = cached.len().div_ceil(CONTACT_PROXY_CHUNK_SIZE);
             let mut chunk_min = vec![DVec3::ZERO; chunk_count];
             let mut chunk_max = vec![DVec3::ZERO; chunk_count];
-            project_ball_contacts(
-                &mut cached,
-                &ball_indices,
-                &mut proxy_start,
-                &mut proxy_end,
-                &mut chunk_min,
-                &mut chunk_max,
-            );
+            project_ball_contacts(&mut cached, &ball_indices, &mut chunk_min, &mut chunk_max);
             project_ball_contacts_uncached(&mut uncached, &ball_indices);
 
             let maximum_error = cached
@@ -3525,16 +3510,21 @@ mod tests {
             }
 
             let net_body_count = simulation.ball_indices[0];
-            let mut proxy_start = vec![DVec3::ZERO; simulation.bodies.len()];
-            let mut proxy_end = vec![DVec3::ZERO; simulation.bodies.len()];
             let mut maximum_error = 0.0_f64;
+            let mut maximum_broad_bound_violation = 0.0_f64;
             for body_index in 0..net_body_count {
-                refresh_contact_proxy(
-                    &simulation.bodies,
-                    body_index,
-                    &mut proxy_start,
-                    &mut proxy_end,
-                );
+                let (proxy_start, proxy_end) =
+                    detailed_contact_proxy(&simulation.bodies[body_index]);
+                let (broad_start, broad_end) = broad_contact_proxy(&simulation.bodies[body_index]);
+                let broad_minimum = broad_start.min(broad_end);
+                let broad_maximum = broad_start.max(broad_end);
+                for point in [proxy_start, proxy_end] {
+                    for axis in 0..3 {
+                        maximum_broad_bound_violation = maximum_broad_bound_violation
+                            .max(broad_minimum[axis] - point[axis])
+                            .max(point[axis] - broad_maximum[axis]);
+                    }
+                }
                 let (expected_start, expected_end) = match simulation.bodies[body_index].kind {
                     BodyKind::Hub { .. } => {
                         let center = attachment_position(
@@ -3556,13 +3546,54 @@ mod tests {
                     BodyKind::Ball => unreachable!("balls follow all net bodies"),
                 };
                 maximum_error = maximum_error
-                    .max((proxy_start[body_index] - expected_start).length())
-                    .max((proxy_end[body_index] - expected_end).length());
+                    .max((proxy_start - expected_start).length())
+                    .max((proxy_end - expected_end).length());
             }
             assert!(
                 maximum_error < 1.0e-13,
                 "{grid_size}x{grid_size} proxy error after {warmup_steps} steps: {maximum_error}"
             );
+            assert!(
+                maximum_broad_bound_violation < 1.0e-13,
+                "{grid_size}x{grid_size} broad bound violation after {warmup_steps} steps: \
+                 {maximum_broad_bound_violation}"
+            );
+        }
+    }
+
+    #[test]
+    fn on_demand_ball_contacts_match_detailed_bounds_exactly() {
+        for (grid_size, warmup_steps) in [(10, 0), (10, 20), (10, 100), (25, 20), (25, 100)] {
+            let mut simulation = NetSimulation::with_grid_size(DemoScene::FallingBalls, grid_size);
+            for _ in 0..warmup_steps {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let ball_indices = simulation.ball_indices.clone();
+            let mut on_demand = simulation.bodies.clone();
+            let mut detailed_bounds = simulation.bodies;
+            let chunk_count = on_demand.len().div_ceil(CONTACT_PROXY_CHUNK_SIZE);
+            let mut on_demand_chunk_min = vec![DVec3::ZERO; chunk_count];
+            let mut on_demand_chunk_max = vec![DVec3::ZERO; chunk_count];
+            let mut detailed_chunk_min = vec![DVec3::ZERO; chunk_count];
+            let mut detailed_chunk_max = vec![DVec3::ZERO; chunk_count];
+
+            project_ball_contact_passes(
+                &mut on_demand,
+                &ball_indices,
+                &mut on_demand_chunk_min,
+                &mut on_demand_chunk_max,
+            );
+            project_ball_contact_passes_detailed_bounds_reference(
+                &mut detailed_bounds,
+                &ball_indices,
+                &mut detailed_chunk_min,
+                &mut detailed_chunk_max,
+            );
+
+            for (on_demand, detailed_bounds) in on_demand.iter().zip(&detailed_bounds) {
+                assert_eq!(on_demand.positions, detailed_bounds.positions);
+            }
         }
     }
 
@@ -3578,20 +3609,14 @@ mod tests {
             let mut reused = simulation.bodies.clone();
             let mut rebuilt = simulation.bodies;
             let chunk_count = reused.len().div_ceil(CONTACT_PROXY_CHUNK_SIZE);
-            let mut reused_proxy_start = vec![DVec3::ZERO; reused.len()];
-            let mut reused_proxy_end = vec![DVec3::ZERO; reused.len()];
             let mut reused_chunk_min = vec![DVec3::ZERO; chunk_count];
             let mut reused_chunk_max = vec![DVec3::ZERO; chunk_count];
-            let mut rebuilt_proxy_start = vec![DVec3::ZERO; rebuilt.len()];
-            let mut rebuilt_proxy_end = vec![DVec3::ZERO; rebuilt.len()];
             let mut rebuilt_chunk_min = vec![DVec3::ZERO; chunk_count];
             let mut rebuilt_chunk_max = vec![DVec3::ZERO; chunk_count];
 
             project_ball_contact_passes(
                 &mut reused,
                 &ball_indices,
-                &mut reused_proxy_start,
-                &mut reused_proxy_end,
                 &mut reused_chunk_min,
                 &mut reused_chunk_max,
             );
@@ -3599,8 +3624,6 @@ mod tests {
                 project_ball_contacts(
                     &mut rebuilt,
                     &ball_indices,
-                    &mut rebuilt_proxy_start,
-                    &mut rebuilt_proxy_end,
                     &mut rebuilt_chunk_min,
                     &mut rebuilt_chunk_max,
                 );
@@ -3609,8 +3632,6 @@ mod tests {
             for (reused, rebuilt) in reused.iter().zip(&rebuilt) {
                 assert_eq!(reused.positions, rebuilt.positions);
             }
-            assert_eq!(reused_proxy_start, rebuilt_proxy_start);
-            assert_eq!(reused_proxy_end, rebuilt_proxy_end);
         }
     }
 
@@ -3644,19 +3665,10 @@ mod tests {
         let mut chunked = vec![hub, left_ball, right_ball];
         let mut uncached = chunked.clone();
         let initial_right_ball = chunked[2].centroid();
-        let mut proxy_start = vec![DVec3::ZERO; chunked.len()];
-        let mut proxy_end = vec![DVec3::ZERO; chunked.len()];
         let mut chunk_min = vec![DVec3::ZERO; 1];
         let mut chunk_max = vec![DVec3::ZERO; 1];
 
-        project_ball_contacts(
-            &mut chunked,
-            &[1, 2],
-            &mut proxy_start,
-            &mut proxy_end,
-            &mut chunk_min,
-            &mut chunk_max,
-        );
+        project_ball_contacts(&mut chunked, &[1, 2], &mut chunk_min, &mut chunk_max);
         project_ball_contacts_uncached(&mut uncached, &[1, 2]);
 
         let maximum_error = chunked
@@ -3675,6 +3687,12 @@ mod tests {
             "chunk update error: {maximum_error}"
         );
         assert!(chunked[2].centroid().x > initial_right_ball.x);
+        let (updated_start, updated_end) = detailed_contact_proxy(&chunked[0]);
+        for point in [updated_start, updated_end] {
+            assert!((0..3).all(|axis| {
+                point[axis] >= chunk_min[0][axis] && point[axis] <= chunk_max[0][axis]
+            }));
+        }
     }
 
     #[test]
@@ -4157,18 +4175,9 @@ mod tests {
             ball.inverse_diagonal = 1.0;
             let mut bodies = vec![rod, ball];
 
-            let mut proxy_start = vec![DVec3::ZERO; bodies.len()];
-            let mut proxy_end = vec![DVec3::ZERO; bodies.len()];
             let mut chunk_min = vec![DVec3::ZERO; 1];
             let mut chunk_max = vec![DVec3::ZERO; 1];
-            project_ball_contacts(
-                &mut bodies,
-                &[1],
-                &mut proxy_start,
-                &mut proxy_end,
-                &mut chunk_min,
-                &mut chunk_max,
-            );
+            project_ball_contacts(&mut bodies, &[1], &mut chunk_min, &mut chunk_max);
 
             let separation = sphere_rod_separation(&bodies, 1, 0);
             assert!(separation.abs() < 1.0e-10, "separation: {separation}");
@@ -4191,18 +4200,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut proxy_start = vec![DVec3::ZERO; bodies.len()];
-        let mut proxy_end = vec![DVec3::ZERO; bodies.len()];
         let mut chunk_min = vec![DVec3::ZERO; 1];
         let mut chunk_max = vec![DVec3::ZERO; 1];
-        project_ball_contacts(
-            &mut bodies,
-            &[0, 1],
-            &mut proxy_start,
-            &mut proxy_end,
-            &mut chunk_min,
-            &mut chunk_max,
-        );
+        project_ball_contacts(&mut bodies, &[0, 1], &mut chunk_min, &mut chunk_max);
 
         let distance = (bodies[0].centroid() - bodies[1].centroid()).length();
         assert!(bodies.iter().all(|body| body.centroid().is_finite()));
