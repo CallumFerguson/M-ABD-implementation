@@ -504,6 +504,7 @@ impl NetSimulation {
                 &self.solver_scratch.solution,
                 &mut self.solver_scratch.hub_weighted_residual,
                 self.grid_size * self.grid_size,
+                self.grid_size,
             );
 
             match self.scene {
@@ -2001,11 +2002,31 @@ fn apply_joint_correction(
     multipliers: &[DVec3],
     hub_forces: &mut [DVec3],
     hub_count: usize,
+    grid_size: usize,
 ) {
-    hub_forces.fill(DVec3::ZERO);
-
-    for (joint, multiplier) in joints.iter().zip(multipliers) {
-        hub_forces[joint.b.body] += -*multiplier * HUB_CENTER[0];
+    debug_assert_eq!(hub_count, grid_size * grid_size);
+    let horizontal_rod_count = grid_size * (grid_size - 1);
+    for row in 0..grid_size {
+        for column in 0..grid_size {
+            let mut force = DVec3::ZERO;
+            if column > 0 {
+                let joint = 2 * (row * (grid_size - 1) + column - 1) + 1;
+                force += -multipliers[joint] * HUB_CENTER[0];
+            }
+            if column + 1 < grid_size {
+                let joint = 2 * (row * (grid_size - 1) + column);
+                force += -multipliers[joint] * HUB_CENTER[0];
+            }
+            if row > 0 {
+                let joint = 2 * (horizontal_rod_count + (row - 1) * grid_size + column) + 1;
+                force += -multipliers[joint] * HUB_CENTER[0];
+            }
+            if row + 1 < grid_size {
+                let joint = 2 * (horizontal_rod_count + row * grid_size + column);
+                force += -multipliers[joint] * HUB_CENTER[0];
+            }
+            hub_forces[row * grid_size + column] = force;
+        }
     }
 
     let (hubs, non_hubs) = bodies.split_at_mut(hub_count);
@@ -2568,15 +2589,22 @@ mod tests {
             let mut specialized = simulation.bodies.clone();
             let mut generic = simulation.bodies;
 
+            let hub_count = simulation.grid_size * simulation.grid_size;
+            let mut expected_hub_forces = vec![DVec3::ZERO; hub_count];
+            for (joint, multiplier) in simulation.joints.iter().zip(&multipliers) {
+                expected_hub_forces[joint.b.body] += -*multiplier * HUB_CENTER[0];
+            }
             let mut hub_forces = vec![DVec3::ZERO; specialized.len()];
             apply_joint_correction(
                 &mut specialized,
                 &simulation.joints,
                 &multipliers,
                 &mut hub_forces,
-                simulation.grid_size * simulation.grid_size,
+                hub_count,
+                simulation.grid_size,
             );
             apply_joint_correction_generic(&mut generic, &simulation.joints, &multipliers);
+            assert_eq!(&hub_forces[..hub_count], expected_hub_forces);
 
             let maximum_error = specialized
                 .iter()
