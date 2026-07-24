@@ -579,6 +579,7 @@ impl NetSimulation {
         &mut self,
         dt: f64,
     ) {
+        let previous_velocity_scale = self.previous_velocity_scale;
         let dt_bits = dt.to_bits();
         if self.coefficient_dt_bits != dt_bits {
             for body in &mut self.bodies {
@@ -586,10 +587,11 @@ impl NetSimulation {
             }
             prepare_direct_joint_solver(&self.bodies, &self.joints, &mut self.solver_scratch);
             self.coefficient_dt_bits = dt_bits;
+            self.previous_velocity_scale = velocity_damping_for_dt(dt) / dt;
         }
 
         for body in &mut self.bodies {
-            body.predict_positions(dt, self.previous_velocity_scale);
+            body.predict_positions(dt, previous_velocity_scale);
         }
 
         for _ in 0..COROTATED_ITERATIONS {
@@ -649,8 +651,6 @@ impl NetSimulation {
                 }
             }
         }
-
-        self.previous_velocity_scale = velocity_damping_for_dt(dt) / dt;
     }
 }
 
