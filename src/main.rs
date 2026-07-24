@@ -2615,6 +2615,33 @@ fn closest_rotation_with_iterations<const ITERATIONS: usize>(matrix: DMat3) -> D
         rotation = (rotation + rotation.inverse().transpose()) * 0.5;
     }
 
+    let Some(x) = rotation.x_axis.try_normalize() else {
+        return DMat3::IDENTITY;
+    };
+    let Some(mut y) = (rotation.y_axis - x * x.dot(rotation.y_axis)).try_normalize() else {
+        return DMat3::IDENTITY;
+    };
+
+    let mut z = x.cross(y);
+    if z.dot(rotation.z_axis) < 0.0 {
+        z = -z;
+    }
+    y = z.cross(x);
+
+    DMat3::from_cols(x, y, z)
+}
+
+#[cfg(test)]
+fn closest_rotation_with_legacy_tail<const ITERATIONS: usize>(matrix: DMat3) -> DMat3 {
+    let mut rotation = matrix;
+
+    for _ in 0..ITERATIONS {
+        if rotation.determinant().abs() <= 1.0e-12 {
+            break;
+        }
+        rotation = (rotation + rotation.inverse().transpose()) * 0.5;
+    }
+
     let x = rotation.x_axis.normalize_or_zero();
     let mut y = (rotation.y_axis - x * x.dot(rotation.y_axis)).normalize_or_zero();
     if x.length_squared() <= 1.0e-12 || y.length_squared() <= 1.0e-12 {
@@ -2652,6 +2679,67 @@ mod tests {
     #[ignore = "performance check; run `cargo bench-scenes`"]
     fn step_time_scene_3_falling_balls() {
         report_step_time(DemoScene::FallingBalls);
+    }
+
+    #[test]
+    fn optimized_rotation_tail_matches_legacy_tail() {
+        let mut maximum_component_error = 0.0_f64;
+        let mut maximum_orthonormality_error = 0.0_f64;
+
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut simulation = NetSimulation::new(scene);
+            for step in 0..=150 {
+                if matches!(step, 0 | 20 | 150) {
+                    for body in &simulation.bodies {
+                        if !matches!(body.kind, BodyKind::Rod) {
+                            continue;
+                        }
+                        let gradient = rod_deformation_gradient(&body.positions);
+                        let optimized = closest_rotation(gradient);
+                        let legacy =
+                            closest_rotation_with_legacy_tail::<POLAR_NEWTON_ITERATIONS>(gradient);
+                        maximum_component_error = maximum_component_error.max(
+                            optimized
+                                .to_cols_array()
+                                .into_iter()
+                                .zip(legacy.to_cols_array())
+                                .map(|(actual, expected)| (actual - expected).abs())
+                                .fold(0.0_f64, f64::max),
+                        );
+                        let orthonormality = optimized.transpose() * optimized - DMat3::IDENTITY;
+                        maximum_orthonormality_error = maximum_orthonormality_error.max(
+                            orthonormality
+                                .to_cols_array()
+                                .into_iter()
+                                .map(f64::abs)
+                                .fold(0.0_f64, f64::max),
+                        );
+                    }
+                }
+                if step < 150 {
+                    simulation.step(1.0 / DEFAULT_FIXED_HZ);
+                }
+            }
+        }
+
+        let zero = DMat3::from_cols(DVec3::ZERO, DVec3::ZERO, DVec3::ZERO);
+        assert_eq!(closest_rotation(zero), DMat3::IDENTITY);
+        assert_eq!(
+            closest_rotation_with_legacy_tail::<POLAR_NEWTON_ITERATIONS>(zero),
+            DMat3::IDENTITY
+        );
+        assert!(
+            maximum_component_error < 2.0e-14,
+            "optimized-vs-legacy rotation error: {maximum_component_error}"
+        );
+        assert!(
+            maximum_orthonormality_error < 2.0e-14,
+            "optimized rotation orthonormality error: {maximum_orthonormality_error}"
+        );
     }
 
     #[test]
