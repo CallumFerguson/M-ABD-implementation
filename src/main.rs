@@ -1566,7 +1566,7 @@ fn rod_deformation_gradient(points: &[DVec3; 4]) -> DMat3 {
 fn closest_rotation(matrix: DMat3) -> DMat3 {
     let mut rotation = matrix;
 
-    for _ in 0..5 {
+    for _ in 0..3 {
         if rotation.determinant().abs() <= 1.0e-12 {
             break;
         }
@@ -1612,6 +1612,63 @@ mod tests {
     #[ignore = "performance check; run `cargo bench-scenes`"]
     fn step_time_scene_3_falling_balls() {
         report_step_time(DemoScene::FallingBalls);
+    }
+
+    #[test]
+    fn three_polar_iterations_match_five_iteration_reference() {
+        fn closest_rotation_with_iterations(matrix: DMat3, iterations: usize) -> DMat3 {
+            let mut rotation = matrix;
+            for _ in 0..iterations {
+                if rotation.determinant().abs() <= 1.0e-12 {
+                    break;
+                }
+                rotation = (rotation + rotation.inverse().transpose()) * 0.5;
+            }
+
+            let x = rotation.x_axis.normalize_or_zero();
+            let mut y = (rotation.y_axis - x * x.dot(rotation.y_axis)).normalize_or_zero();
+            if x.length_squared() <= 1.0e-12 || y.length_squared() <= 1.0e-12 {
+                return DMat3::IDENTITY;
+            }
+            let mut z = x.cross(y).normalize_or_zero();
+            if z.dot(rotation.z_axis) < 0.0 {
+                z = -z;
+            }
+            y = z.cross(x).normalize_or_zero();
+            DMat3::from_cols(x, y, z)
+        }
+
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut simulation = NetSimulation::new(scene);
+            let mut maximum_error = 0.0_f64;
+            for _ in 0..150 {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+                for body in &simulation.bodies {
+                    if !matches!(body.kind, BodyKind::Rod) {
+                        continue;
+                    }
+                    let gradient = rod_deformation_gradient(&body.positions);
+                    let reference = closest_rotation_with_iterations(gradient, 5);
+                    maximum_error = maximum_error.max(
+                        closest_rotation_with_iterations(gradient, 3)
+                            .to_cols_array()
+                            .into_iter()
+                            .zip(reference.to_cols_array())
+                            .map(|(actual, expected)| (actual - expected).abs())
+                            .fold(0.0_f64, f64::max),
+                    );
+                }
+            }
+            assert!(
+                maximum_error < 2.0e-9,
+                "{} three-iteration polar error: {maximum_error}",
+                scene.title()
+            );
+        }
     }
 
     fn report_step_time(scene: DemoScene) {
