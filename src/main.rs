@@ -253,6 +253,8 @@ struct SolverScratch {
     hub_inverse_rod_weight_sum: Vec<f64>,
     hub_weighted_residual: Vec<DVec3>,
     hub_schur_factor: Vec<f64>,
+    contact_proxy_start: Vec<DVec3>,
+    contact_proxy_end: Vec<DVec3>,
 }
 
 impl SolverScratch {
@@ -265,6 +267,8 @@ impl SolverScratch {
             hub_inverse_rod_weight_sum: vec![0.0; body_count],
             hub_weighted_residual: vec![DVec3::ZERO; body_count],
             hub_schur_factor: vec![0.0; body_count],
+            contact_proxy_start: vec![DVec3::ZERO; body_count],
+            contact_proxy_end: vec![DVec3::ZERO; body_count],
         }
     }
 }
@@ -439,7 +443,12 @@ impl NetSimulation {
                         );
                     }
                     DemoScene::FallingBalls => {
-                        project_ball_contacts(&mut self.bodies, &self.ball_indices);
+                        project_ball_contacts(
+                            &mut self.bodies,
+                            &self.ball_indices,
+                            &mut self.solver_scratch.contact_proxy_start,
+                            &mut self.solver_scratch.contact_proxy_end,
+                        );
                     }
                 }
             }
@@ -1130,7 +1139,121 @@ fn project_attachment_against_cylinder(
     project_static_attachment(bodies, attachment, normal, penetration);
 }
 
-fn project_ball_contacts(bodies: &mut [AffineBody], ball_indices: &[usize]) {
+fn project_ball_contacts(
+    bodies: &mut [AffineBody],
+    ball_indices: &[usize],
+    proxy_start: &mut [DVec3],
+    proxy_end: &mut [DVec3],
+) {
+    for first in 0..ball_indices.len() {
+        for second in (first + 1)..ball_indices.len() {
+            let a = Attachment {
+                body: ball_indices[first],
+                weights: HUB_CENTER,
+            };
+            let b = Attachment {
+                body: ball_indices[second],
+                weights: HUB_CENTER,
+            };
+            let fallback = match (first + second) % 3 {
+                0 => DVec3::X,
+                1 => DVec3::Y,
+                _ => DVec3::Z,
+            };
+            project_attachment_pair(bodies, a, b, BALL_RADIUS as f64 * 2.0, fallback);
+        }
+    }
+
+    let net_body_count = ball_indices.first().copied().unwrap_or(bodies.len());
+    for body_index in 0..net_body_count {
+        refresh_contact_proxy(bodies, body_index, proxy_start, proxy_end);
+    }
+
+    for &ball_index in ball_indices {
+        let ball_center = Attachment {
+            body: ball_index,
+            weights: HUB_CENTER,
+        };
+        let mut sphere_position = attachment_position(bodies, ball_center);
+
+        for net_body_index in 0..net_body_count {
+            let contact_applied = match bodies[net_body_index].kind {
+                BodyKind::Hub { .. } => project_attachment_pair_at_positions(
+                    bodies,
+                    ball_center,
+                    Attachment {
+                        body: net_body_index,
+                        weights: HUB_CENTER,
+                    },
+                    sphere_position,
+                    proxy_start[net_body_index],
+                    BALL_RADIUS as f64 + HUB_RADIUS as f64,
+                    DVec3::Y,
+                ),
+                BodyKind::Rod => {
+                    let (start, end) = rod_collider_attachments(net_body_index);
+                    let start_position = proxy_start[net_body_index];
+                    let end_position = proxy_end[net_body_index];
+                    let direction = end_position - start_position;
+                    let denominator = direction.length_squared();
+                    let t = if denominator > CONTACT_EPSILON {
+                        ((sphere_position - start_position).dot(direction) / denominator)
+                            .clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    };
+                    let rod_attachment = interpolate_attachment(start, end, t);
+
+                    project_attachment_pair_at_positions(
+                        bodies,
+                        ball_center,
+                        rod_attachment,
+                        sphere_position,
+                        attachment_position(bodies, rod_attachment),
+                        BALL_RADIUS as f64 + ROD_THICKNESS as f64 * 0.5,
+                        DVec3::Y,
+                    )
+                }
+                BodyKind::Ball => false,
+            };
+
+            if contact_applied {
+                sphere_position = attachment_position(bodies, ball_center);
+                refresh_contact_proxy(bodies, net_body_index, proxy_start, proxy_end);
+            }
+        }
+    }
+}
+
+fn refresh_contact_proxy(
+    bodies: &[AffineBody],
+    body_index: usize,
+    proxy_start: &mut [DVec3],
+    proxy_end: &mut [DVec3],
+) {
+    match bodies[body_index].kind {
+        BodyKind::Hub { .. } => {
+            let center = attachment_position(
+                bodies,
+                Attachment {
+                    body: body_index,
+                    weights: HUB_CENTER,
+                },
+            );
+            proxy_start[body_index] = center;
+            proxy_end[body_index] = center;
+        }
+        BodyKind::Rod => {
+            let (start, end) = rod_collider_attachments(body_index);
+            proxy_start[body_index] = attachment_position(bodies, start);
+            proxy_end[body_index] = attachment_position(bodies, end);
+        }
+        BodyKind::Ball => {}
+    }
+}
+
+#[cfg(test)]
+fn project_ball_contacts_uncached(bodies: &mut [AffineBody], ball_indices: &[usize]) {
     for first in 0..ball_indices.len() {
         for second in (first + 1)..ball_indices.len() {
             let a = Attachment {
@@ -1208,10 +1331,36 @@ fn project_attachment_pair(
         return;
     }
 
-    let delta = attachment_position(bodies, a) - attachment_position(bodies, b);
+    let a_position = attachment_position(bodies, a);
+    let b_position = attachment_position(bodies, b);
+    let _ = project_attachment_pair_at_positions(
+        bodies,
+        a,
+        b,
+        a_position,
+        b_position,
+        minimum_distance,
+        fallback,
+    );
+}
+
+fn project_attachment_pair_at_positions(
+    bodies: &mut [AffineBody],
+    a: Attachment,
+    b: Attachment,
+    a_position: DVec3,
+    b_position: DVec3,
+    minimum_distance: f64,
+    fallback: DVec3,
+) -> bool {
+    if a.body == b.body {
+        return false;
+    }
+
+    let delta = a_position - b_position;
     let distance_squared = delta.length_squared();
     if distance_squared >= minimum_distance * minimum_distance {
-        return;
+        return false;
     }
     let distance = distance_squared.sqrt();
     let penetration = minimum_distance - distance;
@@ -1223,12 +1372,13 @@ fn project_attachment_pair(
     let b_inverse_weight = attachment_inverse_weight(bodies, b);
     let denominator = a_inverse_weight + b_inverse_weight;
     if denominator <= CONTACT_EPSILON {
-        return;
+        return false;
     }
 
     let multiplier = penetration / denominator;
     apply_attachment_position_delta(bodies, a, normal, multiplier);
     apply_attachment_position_delta(bodies, b, -normal, multiplier);
+    true
 }
 
 fn project_static_attachment(
@@ -1817,6 +1967,42 @@ mod tests {
     }
 
     #[test]
+    fn cached_ball_contacts_match_uncached_ordered_projection() {
+        let mut simulation = NetSimulation::new(DemoScene::FallingBalls);
+        for _ in 0..20 {
+            simulation.step(1.0 / DEFAULT_FIXED_HZ);
+        }
+
+        let mut cached = simulation.bodies.clone();
+        let mut uncached = simulation.bodies;
+        let mut proxy_start = vec![DVec3::ZERO; cached.len()];
+        let mut proxy_end = vec![DVec3::ZERO; cached.len()];
+        project_ball_contacts(
+            &mut cached,
+            &simulation.ball_indices,
+            &mut proxy_start,
+            &mut proxy_end,
+        );
+        project_ball_contacts_uncached(&mut uncached, &simulation.ball_indices);
+
+        let maximum_error = cached
+            .iter()
+            .zip(&uncached)
+            .flat_map(|(cached, uncached)| {
+                cached
+                    .positions
+                    .iter()
+                    .zip(&uncached.positions)
+                    .map(|(cached, uncached)| (*cached - *uncached).length())
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(
+            maximum_error < 1.0e-14,
+            "cached contact projection error: {maximum_error}"
+        );
+    }
+
+    #[test]
     fn center_attached_bodies_remain_unrotated() {
         for scene in [
             DemoScene::JointGrid,
@@ -2094,7 +2280,9 @@ mod tests {
             ball.inverse_diagonal = 1.0;
             let mut bodies = vec![rod, ball];
 
-            project_ball_contacts(&mut bodies, &[1]);
+            let mut proxy_start = vec![DVec3::ZERO; bodies.len()];
+            let mut proxy_end = vec![DVec3::ZERO; bodies.len()];
+            project_ball_contacts(&mut bodies, &[1], &mut proxy_start, &mut proxy_end);
 
             let separation = sphere_rod_separation(&bodies, 1, 0);
             assert!(separation.abs() < 1.0e-10, "separation: {separation}");
@@ -2118,7 +2306,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        project_ball_contacts(&mut bodies, &[0, 1]);
+        let mut proxy_start = vec![DVec3::ZERO; bodies.len()];
+        let mut proxy_end = vec![DVec3::ZERO; bodies.len()];
+        project_ball_contacts(&mut bodies, &[0, 1], &mut proxy_start, &mut proxy_end);
 
         let distance = (bodies[0].centroid() - bodies[1].centroid()).length();
         assert!(bodies.iter().all(|body| body.centroid().is_finite()));
