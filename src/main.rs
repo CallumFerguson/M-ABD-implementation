@@ -111,7 +111,6 @@ enum BodyKind {
 struct AffineBody {
     kind: BodyKind,
     fixed: bool,
-    rest_points: [DVec3; 4],
     positions: [DVec3; 4],
     previous_positions: [DVec3; 4],
     predicted_positions: [DVec3; 4],
@@ -136,7 +135,6 @@ impl AffineBody {
         Self {
             kind,
             fixed,
-            rest_points,
             positions,
             previous_positions: positions,
             predicted_positions: positions,
@@ -212,8 +210,9 @@ impl AffineBody {
             BodyKind::Hub { .. } | BodyKind::Ball => {
                 let predicted_center = centroid(&self.predicted_positions);
                 let projected_center = predicted_center * prediction_weight + center * shape_weight;
+                let rest_points = body_rest_points(self.kind);
                 for index in 0..4 {
-                    self.positions[index] = projected_center + self.rest_points[index];
+                    self.positions[index] = projected_center + rest_points[index];
                 }
             }
         }
@@ -230,8 +229,9 @@ impl AffineBody {
             BodyKind::Rod => closest_rotation(rod_deformation_gradient(&self.positions)),
             BodyKind::Hub { .. } | BodyKind::Ball => DMat3::IDENTITY,
         };
+        let rest_points = body_rest_points(self.kind);
         for index in 0..4 {
-            let rigid_target = center + rotation * self.rest_points[index];
+            let rigid_target = center + rotation * rest_points[index];
             self.positions[index] = (self.predicted_positions[index] * self.inertia
                 + rigid_target * self.stiffness)
                 * self.inverse_diagonal;
@@ -1892,6 +1892,14 @@ fn accumulate_attachment(points: &mut [DVec3; 4], weights: [f64; 4], value: DVec
     }
 }
 
+fn body_rest_points(kind: BodyKind) -> [DVec3; 4] {
+    match kind {
+        BodyKind::Hub { .. } => hub_rest_points(),
+        BodyKind::Rod => rod_rest_points(),
+        BodyKind::Ball => ball_rest_points(),
+    }
+}
+
 fn hub_rest_points() -> [DVec3; 4] {
     let radius = HUB_RADIUS as f64;
     let scale = radius / 3.0_f64.sqrt();
@@ -2417,9 +2425,10 @@ mod tests {
                 }
 
                 let center = body.centroid();
+                let rest_points = body_rest_points(body.kind);
                 for index in 0..4 {
                     maximum_shape_error = maximum_shape_error
-                        .max((body.positions[index] - center - body.rest_points[index]).length());
+                        .max((body.positions[index] - center - rest_points[index]).length());
                     maximum_velocity_spread = maximum_velocity_spread
                         .max((body.velocities[index] - body.velocities[0]).length());
                 }
@@ -2457,12 +2466,13 @@ mod tests {
                 }
 
                 let center = body.centroid();
+                let rest_points = rod_rest_points();
                 let covariance = (0..4).fold(DMat3::ZERO, |sum, index| {
                     let position = body.positions[index] - center;
-                    let rest = body.rest_points[index];
+                    let rest = rest_points[index];
                     sum + DMat3::from_cols(position * rest.x, position * rest.y, position * rest.z)
                 });
-                let rest_covariance = body.rest_points.iter().fold(DMat3::ZERO, |sum, rest| {
+                let rest_covariance = rest_points.iter().fold(DMat3::ZERO, |sum, rest| {
                     sum + DMat3::from_cols(*rest * rest.x, *rest * rest.y, *rest * rest.z)
                 });
                 let expected = covariance * rest_covariance.inverse();
@@ -2539,8 +2549,9 @@ mod tests {
             .flat_map(|body| {
                 let center = body.centroid();
                 let rotation = body.rotation();
+                let rest_points = body_rest_points(body.kind);
                 (0..4).map(move |index| {
-                    (body.positions[index] - center - rotation * body.rest_points[index]).length()
+                    (body.positions[index] - center - rotation * rest_points[index]).length()
                 })
             })
             .fold(0.0_f64, f64::max);
