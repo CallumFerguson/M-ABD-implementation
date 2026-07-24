@@ -19,6 +19,7 @@ const GRAVITY: DVec3 = DVec3::new(0.0, -9.81, 0.0);
 const VELOCITY_DAMPING_AT_DEFAULT_HZ: f64 = 0.997;
 const AFFINE_STIFFNESS: f64 = 12_000.0;
 const COROTATED_ITERATIONS: usize = 24;
+const POLAR_NEWTON_ITERATIONS: usize = 2;
 const CONTACT_PASSES: usize = 2;
 const DEMO_COUNT: usize = 3;
 
@@ -178,7 +179,12 @@ impl AffineBody {
         }
     }
 
+    #[cfg(test)]
     fn project_corotated_shape(&mut self) {
+        self.project_corotated_shape_with_polar_iterations::<POLAR_NEWTON_ITERATIONS>();
+    }
+
+    fn project_corotated_shape_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self) {
         if self.fixed {
             return;
         }
@@ -188,7 +194,9 @@ impl AffineBody {
         let shape_weight = self.stiffness * self.inverse_diagonal;
         match self.kind {
             BodyKind::Rod => {
-                let rotation = closest_rotation(rod_deformation_gradient(&self.positions));
+                let rotation = closest_rotation_with_iterations::<POLAR_ITERATIONS>(
+                    rod_deformation_gradient(&self.positions),
+                );
                 let half_length = GRID_SPACING * 0.5;
                 let radius = ROD_THICKNESS as f64 * 0.5;
                 let x = rotation.x_axis * half_length;
@@ -436,6 +444,10 @@ impl NetSimulation {
     }
 
     fn step(&mut self, dt: f64) {
+        self.step_with_polar_iterations::<POLAR_NEWTON_ITERATIONS>(dt);
+    }
+
+    fn step_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self, dt: f64) {
         for body in &mut self.bodies {
             body.predict(dt);
         }
@@ -444,7 +456,7 @@ impl NetSimulation {
 
         for _ in 0..COROTATED_ITERATIONS {
             for body in &mut self.bodies {
-                body.project_corotated_shape();
+                body.project_corotated_shape_with_polar_iterations::<POLAR_ITERATIONS>();
             }
 
             compute_joint_residuals(
@@ -1929,9 +1941,13 @@ fn rod_deformation_gradient(points: &[DVec3; 4]) -> DMat3 {
 }
 
 fn closest_rotation(matrix: DMat3) -> DMat3 {
+    closest_rotation_with_iterations::<POLAR_NEWTON_ITERATIONS>(matrix)
+}
+
+fn closest_rotation_with_iterations<const ITERATIONS: usize>(matrix: DMat3) -> DMat3 {
     let mut rotation = matrix;
 
-    for _ in 0..3 {
+    for _ in 0..ITERATIONS {
         if rotation.determinant().abs() <= 1.0e-12 {
             break;
         }
@@ -1978,8 +1994,8 @@ mod tests {
     }
 
     #[test]
-    fn three_polar_iterations_match_five_iteration_reference() {
-        fn closest_rotation_with_iterations(matrix: DMat3, iterations: usize) -> DMat3 {
+    fn two_polar_iterations_match_higher_iteration_references() {
+        fn reference_rotation(matrix: DMat3, iterations: usize) -> DMat3 {
             let mut rotation = matrix;
             for _ in 0..iterations {
                 if rotation.determinant().abs() <= 1.0e-12 {
@@ -2007,7 +2023,8 @@ mod tests {
             DemoScene::FallingBalls,
         ] {
             let mut simulation = NetSimulation::new(scene);
-            let mut maximum_error = 0.0_f64;
+            let mut maximum_two_iteration_error = 0.0_f64;
+            let mut maximum_three_iteration_error = 0.0_f64;
             for _ in 0..150 {
                 simulation.step(1.0 / DEFAULT_FIXED_HZ);
                 for body in &simulation.bodies {
@@ -2015,20 +2032,79 @@ mod tests {
                         continue;
                     }
                     let gradient = rod_deformation_gradient(&body.positions);
-                    let reference = closest_rotation_with_iterations(gradient, 5);
-                    maximum_error = maximum_error.max(
-                        closest_rotation_with_iterations(gradient, 3)
+                    let three_iteration = reference_rotation(gradient, 3);
+                    let five_iteration = reference_rotation(gradient, 5);
+                    maximum_two_iteration_error = maximum_two_iteration_error.max(
+                        closest_rotation(gradient)
                             .to_cols_array()
                             .into_iter()
-                            .zip(reference.to_cols_array())
+                            .zip(three_iteration.to_cols_array())
+                            .map(|(actual, expected)| (actual - expected).abs())
+                            .fold(0.0_f64, f64::max),
+                    );
+                    maximum_three_iteration_error = maximum_three_iteration_error.max(
+                        three_iteration
+                            .to_cols_array()
+                            .into_iter()
+                            .zip(five_iteration.to_cols_array())
                             .map(|(actual, expected)| (actual - expected).abs())
                             .fold(0.0_f64, f64::max),
                     );
                 }
             }
             assert!(
-                maximum_error < 2.0e-9,
-                "{} three-iteration polar error: {maximum_error}",
+                maximum_two_iteration_error < 2.0e-6,
+                "{} two-iteration polar error: {maximum_two_iteration_error}",
+                scene.title()
+            );
+            assert!(
+                maximum_three_iteration_error < 2.0e-9,
+                "{} three-iteration polar error: {maximum_three_iteration_error}",
+                scene.title()
+            );
+        }
+    }
+
+    #[test]
+    fn two_polar_iterations_preserve_three_iteration_trajectory() {
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut optimized = NetSimulation::new(scene);
+            let mut reference = NetSimulation::new(scene);
+            for _ in 0..150 {
+                optimized.step(1.0 / DEFAULT_FIXED_HZ);
+                reference.step_with_polar_iterations::<3>(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let mut squared_error_sum = 0.0;
+            let mut point_count = 0;
+            let mut maximum_error = 0.0_f64;
+            for (optimized_body, reference_body) in optimized.bodies.iter().zip(&reference.bodies) {
+                for (optimized_point, reference_point) in optimized_body
+                    .positions
+                    .iter()
+                    .zip(reference_body.positions)
+                {
+                    let error = (*optimized_point - reference_point).length();
+                    squared_error_sum += error * error;
+                    point_count += 1;
+                    maximum_error = maximum_error.max(error);
+                }
+            }
+            let rms_error = (squared_error_sum / point_count as f64).sqrt();
+            assert!(simulation_is_finite(&optimized));
+            assert!(simulation_is_finite(&reference));
+            assert!(
+                rms_error < 1.0e-5,
+                "{} two-vs-three polar RMS trajectory error: {rms_error}",
+                scene.title()
+            );
+            assert!(
+                maximum_error < 5.0e-5,
+                "{} two-vs-three polar maximum trajectory error: {maximum_error}",
                 scene.title()
             );
         }
