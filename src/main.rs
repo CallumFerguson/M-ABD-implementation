@@ -1092,22 +1092,28 @@ fn project_cylinder_contacts(bodies: &mut [AffineBody], cylinder: CylinderCollid
                 let start_position = attachment_position(bodies, start);
                 let end_position = attachment_position(bodies, end);
                 let start_radial = reject_from_axis(start_position - cylinder.origin, axis);
-                let direction_radial = reject_from_axis(end_position - start_position, axis);
+                let direction = end_position - start_position;
+                let direction_radial = reject_from_axis(direction, axis);
                 let denominator = direction_radial.length_squared();
                 let t = if denominator > CONTACT_EPSILON {
                     (-start_radial.dot(direction_radial) / denominator).clamp(0.0, 1.0)
                 } else {
                     0.5
                 };
-
-                project_attachment_against_cylinder(
-                    bodies,
-                    interpolate_attachment(start, end, t),
-                    ROD_THICKNESS as f64 * 0.5,
-                    cylinder.origin,
-                    axis,
-                    cylinder.radius,
-                );
+                let radial = start_radial + direction_radial * t;
+                let contact_distance = cylinder.radius + ROD_THICKNESS as f64 * 0.5;
+                let distance_squared = radial.length_squared();
+                if distance_squared < contact_distance * contact_distance {
+                    project_penetrating_attachment_against_cylinder(
+                        bodies,
+                        interpolate_attachment(start, end, t),
+                        radial,
+                        distance_squared,
+                        contact_distance,
+                        cylinder.origin,
+                        axis,
+                    );
+                }
             }
             BodyKind::Ball => {}
         }
@@ -1124,19 +1130,112 @@ fn project_attachment_against_cylinder(
 ) {
     let position = attachment_position(bodies, attachment);
     let radial = reject_from_axis(position - cylinder_origin, cylinder_axis);
+    project_attachment_against_cylinder_at_radial(
+        bodies,
+        attachment,
+        radial,
+        proxy_radius,
+        cylinder_origin,
+        cylinder_axis,
+        cylinder_radius,
+    );
+}
+
+fn project_attachment_against_cylinder_at_radial(
+    bodies: &mut [AffineBody],
+    attachment: Attachment,
+    radial: DVec3,
+    proxy_radius: f64,
+    cylinder_origin: DVec3,
+    cylinder_axis: DVec3,
+    cylinder_radius: f64,
+) {
     let contact_distance = cylinder_radius + proxy_radius;
     let distance_squared = radial.length_squared();
     if distance_squared >= contact_distance * contact_distance {
         return;
     }
+    project_penetrating_attachment_against_cylinder(
+        bodies,
+        attachment,
+        radial,
+        distance_squared,
+        contact_distance,
+        cylinder_origin,
+        cylinder_axis,
+    );
+}
+
+fn project_penetrating_attachment_against_cylinder(
+    bodies: &mut [AffineBody],
+    attachment: Attachment,
+    radial: DVec3,
+    distance_squared: f64,
+    contact_distance: f64,
+    cylinder_origin: DVec3,
+    cylinder_axis: DVec3,
+) {
     let distance = distance_squared.sqrt();
     let penetration = contact_distance - distance;
-
-    let previous = previous_attachment_position(bodies, attachment);
-    let previous_radial = reject_from_axis(previous - cylinder_origin, cylinder_axis);
-    let fallback = perpendicular_to(cylinder_axis);
-    let normal = safe_normal(radial, previous_radial, fallback);
+    let normal = if distance_squared > CONTACT_EPSILON {
+        radial / distance
+    } else {
+        let previous = previous_attachment_position(bodies, attachment);
+        let previous_radial = reject_from_axis(previous - cylinder_origin, cylinder_axis);
+        safe_normal(radial, previous_radial, perpendicular_to(cylinder_axis))
+    };
     project_static_attachment(bodies, attachment, normal, penetration);
+}
+
+#[cfg(test)]
+fn project_cylinder_contacts_reference(bodies: &mut [AffineBody], cylinder: CylinderCollider) {
+    let axis = cylinder.axis.normalize_or_zero();
+    if axis.length_squared() <= CONTACT_EPSILON {
+        return;
+    }
+
+    for body_index in 0..bodies.len() {
+        let (attachment, proxy_radius) = match bodies[body_index].kind {
+            BodyKind::Hub { .. } => (
+                Attachment {
+                    body: body_index,
+                    weights: HUB_CENTER,
+                },
+                HUB_RADIUS as f64,
+            ),
+            BodyKind::Rod => {
+                let (start, end) = rod_collider_attachments(body_index);
+                let start_position = attachment_position(bodies, start);
+                let end_position = attachment_position(bodies, end);
+                let start_radial = reject_from_axis(start_position - cylinder.origin, axis);
+                let direction_radial = reject_from_axis(end_position - start_position, axis);
+                let denominator = direction_radial.length_squared();
+                let t = if denominator > CONTACT_EPSILON {
+                    (-start_radial.dot(direction_radial) / denominator).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                (
+                    interpolate_attachment(start, end, t),
+                    ROD_THICKNESS as f64 * 0.5,
+                )
+            }
+            BodyKind::Ball => continue,
+        };
+
+        let position = attachment_position(bodies, attachment);
+        let radial = reject_from_axis(position - cylinder.origin, axis);
+        let contact_distance = cylinder.radius + proxy_radius;
+        let distance_squared = radial.length_squared();
+        if distance_squared >= contact_distance * contact_distance {
+            continue;
+        }
+        let distance = distance_squared.sqrt();
+        let previous = previous_attachment_position(bodies, attachment);
+        let previous_radial = reject_from_axis(previous - cylinder.origin, axis);
+        let normal = safe_normal(radial, previous_radial, perpendicular_to(axis));
+        project_static_attachment(bodies, attachment, normal, contact_distance - distance);
+    }
 }
 
 fn project_ball_contacts(
@@ -1209,7 +1308,7 @@ fn project_ball_contacts(
                         ball_center,
                         rod_attachment,
                         sphere_position,
-                        attachment_position(bodies, rod_attachment),
+                        start_position + direction * t,
                         BALL_RADIUS as f64 + ROD_THICKNESS as f64 * 0.5,
                         DVec3::Y,
                     )
@@ -1364,10 +1463,13 @@ fn project_attachment_pair_at_positions(
     }
     let distance = distance_squared.sqrt();
     let penetration = minimum_distance - distance;
-
-    let previous_delta =
-        previous_attachment_position(bodies, a) - previous_attachment_position(bodies, b);
-    let normal = safe_normal(delta, previous_delta, fallback);
+    let normal = if distance_squared > CONTACT_EPSILON {
+        delta / distance
+    } else {
+        let previous_delta =
+            previous_attachment_position(bodies, a) - previous_attachment_position(bodies, b);
+        safe_normal(delta, previous_delta, fallback)
+    };
     let a_inverse_weight = attachment_inverse_weight(bodies, a);
     let b_inverse_weight = attachment_inverse_weight(bodies, b);
     let denominator = a_inverse_weight + b_inverse_weight;
@@ -1659,6 +1761,7 @@ fn weighted_point(points: &[DVec3; 4], weights: [f64; 4]) -> DVec3 {
     })
 }
 
+#[cfg(test)]
 fn accumulate_attachment(points: &mut [DVec3; 4], weights: [f64; 4], value: DVec3) {
     for index in 0..4 {
         points[index] += value * weights[index];
@@ -1999,6 +2102,36 @@ mod tests {
         assert!(
             maximum_error < 1.0e-14,
             "cached contact projection error: {maximum_error}"
+        );
+    }
+
+    #[test]
+    fn specialized_cylinder_contacts_match_reference_projection() {
+        let mut simulation = NetSimulation::new(DemoScene::CylinderDrape);
+        for _ in 0..20 {
+            simulation.step(1.0 / DEFAULT_FIXED_HZ);
+        }
+
+        let cylinder = simulation.cylinder.unwrap();
+        let mut specialized = simulation.bodies.clone();
+        let mut reference = simulation.bodies;
+        project_cylinder_contacts(&mut specialized, cylinder);
+        project_cylinder_contacts_reference(&mut reference, cylinder);
+
+        let maximum_error = specialized
+            .iter()
+            .zip(&reference)
+            .flat_map(|(specialized, reference)| {
+                specialized
+                    .positions
+                    .iter()
+                    .zip(&reference.positions)
+                    .map(|(specialized, reference)| (*specialized - *reference).length())
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(
+            maximum_error < 1.0e-12,
+            "specialized cylinder projection error: {maximum_error}"
         );
     }
 
