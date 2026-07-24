@@ -290,14 +290,14 @@ struct SolverScratch {
 }
 
 impl SolverScratch {
-    fn new(body_count: usize, joint_count: usize) -> Self {
+    fn new(body_count: usize, joint_count: usize, hub_count: usize) -> Self {
         Self {
             constraint_residual: vec![DVec3::ZERO; joint_count],
             solution: vec![DVec3::ZERO; joint_count],
             joint_rod_inverse_weight: vec![0.0; joint_count],
-            hub_inverse_rod_weight_sum: vec![0.0; body_count],
-            hub_weighted_residual: vec![DVec3::ZERO; body_count],
-            hub_schur_factor: vec![0.0; body_count],
+            hub_inverse_rod_weight_sum: vec![0.0; hub_count],
+            hub_weighted_residual: vec![DVec3::ZERO; hub_count],
+            hub_schur_factor: vec![0.0; hub_count],
             contact_proxy_start: vec![DVec3::ZERO; body_count],
             contact_proxy_end: vec![DVec3::ZERO; body_count],
         }
@@ -421,7 +421,8 @@ impl NetSimulation {
         }
 
         debug_validate_direct_solver_topology(&bodies, &joints);
-        let solver_scratch = SolverScratch::new(bodies.len(), joints.len());
+        let hub_count = grid_size * grid_size;
+        let solver_scratch = SolverScratch::new(bodies.len(), joints.len(), hub_count);
 
         Self {
             scene,
@@ -450,6 +451,7 @@ impl NetSimulation {
                 &self.bodies,
                 &self.joints,
                 &mut self.solver_scratch.constraint_residual,
+                self.grid_size * self.grid_size,
             );
 
             solve_dual_direct(&self.joints, &mut self.solver_scratch);
@@ -458,6 +460,7 @@ impl NetSimulation {
                 &self.joints,
                 &self.solver_scratch.solution,
                 &mut self.solver_scratch.hub_weighted_residual,
+                self.grid_size * self.grid_size,
             );
 
             for _ in 0..CONTACT_PASSES {
@@ -1640,18 +1643,29 @@ fn prepare_direct_joint_solver(
     }
 }
 
-fn compute_joint_residuals(bodies: &[AffineBody], joints: &[BallJoint], residuals: &mut [DVec3]) {
-    for (residual, joint) in residuals.iter_mut().zip(joints) {
-        let rod = &bodies[joint.a.body].positions;
-        let rod_endpoint = if joint.a.weights[0] != 0.0 {
-            rod[0] * 0.5 + rod[1] * 0.5
-        } else {
-            debug_assert_eq!(joint.a.weights, ROD_END);
-            rod[2] * 0.5 + rod[3] * 0.5
-        };
-        let hub = &bodies[joint.b.body].positions;
-        let hub_center = hub[0] * 0.25 + hub[1] * 0.25 + hub[2] * 0.25 + hub[3] * 0.25;
-        *residual = rod_endpoint - hub_center;
+fn compute_joint_residuals(
+    bodies: &[AffineBody],
+    joints: &[BallJoint],
+    residuals: &mut [DVec3],
+    hub_count: usize,
+) {
+    let rod_count = joints.len() / 2;
+    let rods = &bodies[hub_count..hub_count + rod_count];
+
+    for ((rod, joint_pair), residual_pair) in rods
+        .iter()
+        .zip(joints.chunks_exact(2))
+        .zip(residuals.chunks_exact_mut(2))
+    {
+        let positions = &rod.positions;
+        let start_hub = &bodies[joint_pair[0].b.body].positions;
+        let end_hub = &bodies[joint_pair[1].b.body].positions;
+        let start_hub_center =
+            start_hub[0] * 0.25 + start_hub[1] * 0.25 + start_hub[2] * 0.25 + start_hub[3] * 0.25;
+        let end_hub_center =
+            end_hub[0] * 0.25 + end_hub[1] * 0.25 + end_hub[2] * 0.25 + end_hub[3] * 0.25;
+        residual_pair[0] = positions[0] * 0.5 + positions[1] * 0.5 - start_hub_center;
+        residual_pair[1] = positions[2] * 0.5 + positions[3] * 0.5 - end_hub_center;
     }
 }
 
@@ -1669,6 +1683,19 @@ fn compute_joint_residuals_generic(
 #[cfg(debug_assertions)]
 fn debug_validate_direct_solver_topology(bodies: &[AffineBody], joints: &[BallJoint]) {
     let mut rod_endpoint_counts = vec![[0_u8; 2]; bodies.len()];
+    let hub_count = bodies
+        .iter()
+        .take_while(|body| matches!(body.kind, BodyKind::Hub { .. }))
+        .count();
+
+    debug_assert_eq!(joints.len() % 2, 0);
+    for (rod_offset, pair) in joints.chunks_exact(2).enumerate() {
+        let rod = hub_count + rod_offset;
+        debug_assert_eq!(pair[0].a.body, rod);
+        debug_assert_eq!(pair[0].a.weights, ROD_START);
+        debug_assert_eq!(pair[1].a.body, rod);
+        debug_assert_eq!(pair[1].a.weights, ROD_END);
+    }
 
     for joint in joints {
         debug_assert!(
@@ -1765,29 +1792,31 @@ fn apply_joint_correction(
     joints: &[BallJoint],
     multipliers: &[DVec3],
     hub_forces: &mut [DVec3],
+    hub_count: usize,
 ) {
     hub_forces.fill(DVec3::ZERO);
 
     for (joint, multiplier) in joints.iter().zip(multipliers) {
-        let rod = &mut bodies[joint.a.body];
-        let correction = (*multiplier * 0.5) * rod.inverse_diagonal;
-        if joint.a.weights[0] != 0.0 {
-            rod.positions[0] -= correction;
-            rod.positions[1] -= correction;
-        } else {
-            debug_assert_eq!(joint.a.weights, ROD_END);
-            rod.positions[2] -= correction;
-            rod.positions[3] -= correction;
-        }
         hub_forces[joint.b.body] += -*multiplier * HUB_CENTER[0];
     }
 
-    for (body, force) in bodies.iter_mut().zip(hub_forces.iter()) {
-        if body.fixed || !matches!(body.kind, BodyKind::Hub { .. }) {
+    let (hubs, non_hubs) = bodies.split_at_mut(hub_count);
+    let rods = &mut non_hubs[..joints.len() / 2];
+    for (rod, multiplier_pair) in rods.iter_mut().zip(multipliers.chunks_exact(2)) {
+        let start_correction = (multiplier_pair[0] * 0.5) * rod.inverse_diagonal;
+        let end_correction = (multiplier_pair[1] * 0.5) * rod.inverse_diagonal;
+        rod.positions[0] -= start_correction;
+        rod.positions[1] -= start_correction;
+        rod.positions[2] -= end_correction;
+        rod.positions[3] -= end_correction;
+    }
+
+    for (hub, force) in hubs.iter_mut().zip(hub_forces) {
+        if hub.fixed {
             continue;
         }
-        for position in &mut body.positions {
-            *position -= *force * body.inverse_diagonal;
+        for position in &mut hub.positions {
+            *position -= *force * hub.inverse_diagonal;
         }
     }
 }
@@ -2137,6 +2166,7 @@ mod tests {
                 &simulation.joints,
                 &multipliers,
                 &mut hub_forces,
+                simulation.grid_size * simulation.grid_size,
             );
             apply_joint_correction_generic(&mut generic, &simulation.joints, &multipliers);
 
@@ -2169,7 +2199,12 @@ mod tests {
 
             let mut specialized = vec![DVec3::ZERO; simulation.joints.len()];
             let mut generic = vec![DVec3::ZERO; simulation.joints.len()];
-            compute_joint_residuals(&simulation.bodies, &simulation.joints, &mut specialized);
+            compute_joint_residuals(
+                &simulation.bodies,
+                &simulation.joints,
+                &mut specialized,
+                simulation.grid_size * simulation.grid_size,
+            );
             compute_joint_residuals_generic(&simulation.bodies, &simulation.joints, &mut generic);
 
             let maximum_error = specialized
