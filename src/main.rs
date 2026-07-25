@@ -624,22 +624,27 @@ impl NetSimulation {
     }
 
     fn step_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self, dt: f64) {
-        self.step_with_joint_projection::<POLAR_ITERATIONS, true, true, true>(dt);
+        self.step_with_joint_projection::<POLAR_ITERATIONS, true, true, true, true>(dt);
     }
 
     #[cfg(test)]
     fn step_with_dual_projection(&mut self, dt: f64) {
-        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, false, true, true>(dt);
+        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, false, true, true, true>(dt);
     }
 
     #[cfg(test)]
     fn step_with_divisive_final_polar_round(&mut self, dt: f64) {
-        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, true, false, true>(dt);
+        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, true, false, true, true>(dt);
     }
 
     #[cfg(test)]
     fn step_with_legacy_rod_geometry(&mut self, dt: f64) {
-        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, true, true, false>(dt);
+        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, true, true, false, true>(dt);
+    }
+
+    #[cfg(test)]
+    fn step_with_pass_major_cylinder_contacts(&mut self, dt: f64) {
+        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, true, true, true, false>(dt);
     }
 
     fn step_with_joint_projection<
@@ -647,6 +652,7 @@ impl NetSimulation {
         const DIRECT: bool,
         const DIVISION_FREE_FINAL: bool,
         const FUSED_ROD_GEOMETRY: bool,
+        const BODY_MAJOR_CYLINDER: bool,
     >(
         &mut self,
         dt: f64,
@@ -707,11 +713,23 @@ impl NetSimulation {
             match self.scene {
                 DemoScene::JointGrid => {}
                 DemoScene::CylinderDrape => {
-                    project_cylinder_contact_passes(
-                        &mut self.bodies,
-                        &self.previous_positions,
-                        self.cylinder.expect("cylinder scene must have a collider"),
-                    );
+                    let cylinder = self.cylinder.expect("cylinder scene must have a collider");
+                    if BODY_MAJOR_CYLINDER {
+                        project_cylinder_contact_passes(
+                            &mut self.bodies,
+                            &self.previous_positions,
+                            cylinder,
+                        );
+                    } else {
+                        #[cfg(test)]
+                        project_cylinder_contact_passes_pass_major_reference(
+                            &mut self.bodies,
+                            &self.previous_positions,
+                            cylinder,
+                        );
+                        #[cfg(not(test))]
+                        unreachable!("the pass-major cylinder projection is test-only");
+                    }
                 }
                 DemoScene::FallingBalls => {
                     project_ball_contact_passes(
@@ -1353,6 +1371,7 @@ fn add_rod(
     });
 }
 
+#[cfg(test)]
 fn project_cylinder_contacts(
     bodies: &mut [AffineBody],
     previous_positions: &[[DVec3; 4]],
@@ -1362,60 +1381,124 @@ fn project_cylinder_contacts(
     debug_assert_eq!(bodies.len(), previous_positions.len());
 
     for body_index in 0..bodies.len() {
-        match bodies[body_index].kind {
-            BodyKind::Hub { .. } => project_attachment_against_cylinder(
-                bodies,
-                previous_positions,
-                Attachment {
-                    body: body_index,
-                    weights: HUB_CENTER,
-                },
-                HUB_RADIUS as f64,
-                cylinder.origin,
-                cylinder.radius,
-            ),
-            BodyKind::Rod => {
-                let (start, end) = rod_collider_attachments(body_index);
-                let start_position = attachment_position(bodies, start);
-                let end_position = attachment_position(bodies, end);
-                let start_radial = reject_from_x_axis(start_position - cylinder.origin);
-                let direction = end_position - start_position;
-                let direction_radial = reject_from_x_axis(direction);
-                let contact_distance = cylinder.radius + ROD_THICKNESS as f64 * 0.5;
-                let radial_midpoint = start_radial + direction_radial * 0.5;
-                let radial_half_extents =
-                    direction_radial.abs() * 0.5 + DVec3::splat(contact_distance);
-                if radial_midpoint.y.abs() > radial_half_extents.y
-                    || radial_midpoint.z.abs() > radial_half_extents.z
-                {
-                    continue;
-                }
-                let denominator = direction_radial.length_squared();
-                let t = if denominator > CONTACT_EPSILON {
-                    (-start_radial.dot(direction_radial) / denominator).clamp(0.0, 1.0)
-                } else {
-                    0.5
-                };
-                let radial = start_radial + direction_radial * t;
-                let distance_squared = radial.length_squared();
-                if distance_squared < contact_distance * contact_distance {
-                    project_penetrating_attachment_against_cylinder(
-                        bodies,
-                        previous_positions,
-                        interpolate_attachment(start, end, t),
-                        radial,
-                        distance_squared,
-                        contact_distance,
-                        cylinder.origin,
-                    );
-                }
+        let _ = project_cylinder_contact_at_index(bodies, previous_positions, body_index, cylinder);
+    }
+}
+
+#[inline]
+fn project_cylinder_contact_at_index(
+    bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
+    body_index: usize,
+    cylinder: CylinderCollider,
+) -> bool {
+    match bodies[body_index].kind {
+        BodyKind::Hub { .. } => project_attachment_against_cylinder(
+            bodies,
+            previous_positions,
+            Attachment {
+                body: body_index,
+                weights: HUB_CENTER,
+            },
+            HUB_RADIUS as f64,
+            cylinder.origin,
+            cylinder.radius,
+        ),
+        BodyKind::Rod => {
+            let (start, end) = rod_collider_attachments(body_index);
+            let start_position = attachment_position(bodies, start);
+            let end_position = attachment_position(bodies, end);
+            let start_radial = reject_from_x_axis(start_position - cylinder.origin);
+            let direction = end_position - start_position;
+            let direction_radial = reject_from_x_axis(direction);
+            let contact_distance = cylinder.radius + ROD_THICKNESS as f64 * 0.5;
+            let radial_midpoint = start_radial + direction_radial * 0.5;
+            let radial_half_extents = direction_radial.abs() * 0.5 + DVec3::splat(contact_distance);
+            if radial_midpoint.y.abs() > radial_half_extents.y
+                || radial_midpoint.z.abs() > radial_half_extents.z
+            {
+                return false;
             }
-            BodyKind::Ball => {}
+            let denominator = direction_radial.length_squared();
+            let t = if denominator > CONTACT_EPSILON {
+                (-start_radial.dot(direction_radial) / denominator).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            let radial = start_radial + direction_radial * t;
+            let distance_squared = radial.length_squared();
+            if distance_squared < contact_distance * contact_distance {
+                project_penetrating_attachment_against_cylinder(
+                    bodies,
+                    previous_positions,
+                    interpolate_attachment(start, end, t),
+                    radial,
+                    distance_squared,
+                    contact_distance,
+                    cylinder.origin,
+                )
+            } else {
+                false
+            }
+        }
+        BodyKind::Ball => false,
+    }
+}
+
+fn project_cylinder_contacts_body_major(
+    bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
+    cylinder: CylinderCollider,
+) {
+    debug_assert_eq!(cylinder.axis, DVec3::X);
+    debug_assert_eq!(bodies.len(), previous_positions.len());
+    debug_assert!(CONTACT_PASSES > 0);
+
+    for body_index in 0..bodies.len() {
+        if !project_cylinder_contact_at_index(bodies, previous_positions, body_index, cylinder) {
+            continue;
+        }
+        for _ in 1..CONTACT_PASSES {
+            if !project_cylinder_contact_at_index(bodies, previous_positions, body_index, cylinder)
+            {
+                break;
+            }
         }
     }
 }
 
 fn project_cylinder_contact_passes(
+    bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
+    cylinder: CylinderCollider,
+) {
+    debug_assert_eq!(bodies.len(), previous_positions.len());
+    #[cfg(not(target_arch = "wasm32"))]
+    if bodies.len() >= PARALLEL_CYLINDER_BODY_THRESHOLD
+        && let Some(task_pool) = ComputeTaskPool::try_get()
+    {
+        let task_count = task_pool.thread_num().saturating_mul(2).max(1);
+        if task_count > 1 {
+            let chunk_size = bodies.len().div_ceil(task_count);
+            task_pool.scope(|scope| {
+                for (chunk, previous_chunk) in bodies
+                    .chunks_mut(chunk_size)
+                    .zip(previous_positions.chunks(chunk_size))
+                {
+                    scope.spawn(async move {
+                        project_cylinder_contacts_body_major(chunk, previous_chunk, cylinder);
+                    });
+                }
+            });
+            return;
+        }
+    }
+
+    project_cylinder_contacts_body_major(bodies, previous_positions, cylinder);
+}
+
+#[cfg(test)]
+fn project_cylinder_contact_passes_pass_major_reference(
     bodies: &mut [AffineBody],
     previous_positions: &[[DVec3; 4]],
     cylinder: CylinderCollider,
@@ -1456,7 +1539,7 @@ fn project_attachment_against_cylinder(
     proxy_radius: f64,
     cylinder_origin: DVec3,
     cylinder_radius: f64,
-) {
+) -> bool {
     let position = attachment_position(bodies, attachment);
     let radial = reject_from_x_axis(position - cylinder_origin);
     project_attachment_against_cylinder_at_radial(
@@ -1467,7 +1550,7 @@ fn project_attachment_against_cylinder(
         proxy_radius,
         cylinder_origin,
         cylinder_radius,
-    );
+    )
 }
 
 fn project_attachment_against_cylinder_at_radial(
@@ -1478,11 +1561,11 @@ fn project_attachment_against_cylinder_at_radial(
     proxy_radius: f64,
     cylinder_origin: DVec3,
     cylinder_radius: f64,
-) {
+) -> bool {
     let contact_distance = cylinder_radius + proxy_radius;
     let distance_squared = radial.length_squared();
     if distance_squared >= contact_distance * contact_distance {
-        return;
+        return false;
     }
     project_penetrating_attachment_against_cylinder(
         bodies,
@@ -1492,7 +1575,7 @@ fn project_attachment_against_cylinder_at_radial(
         distance_squared,
         contact_distance,
         cylinder_origin,
-    );
+    )
 }
 
 fn project_penetrating_attachment_against_cylinder(
@@ -1503,7 +1586,7 @@ fn project_penetrating_attachment_against_cylinder(
     distance_squared: f64,
     contact_distance: f64,
     cylinder_origin: DVec3,
-) {
+) -> bool {
     let distance = distance_squared.sqrt();
     let penetration = contact_distance - distance;
     let normal = if distance_squared > CONTACT_EPSILON {
@@ -1513,7 +1596,7 @@ fn project_penetrating_attachment_against_cylinder(
         let previous_radial = reject_from_x_axis(previous - cylinder_origin);
         safe_normal(radial, previous_radial, DVec3::Y)
     };
-    project_static_attachment(bodies, attachment, normal, penetration);
+    project_static_attachment(bodies, attachment, normal, penetration)
 }
 
 #[cfg(test)]
@@ -2099,13 +2182,14 @@ fn project_static_attachment(
     attachment: Attachment,
     normal: DVec3,
     penetration: f64,
-) {
+) -> bool {
     let inverse_weight = attachment_inverse_weight(bodies, attachment);
-    if inverse_weight <= CONTACT_EPSILON {
-        return;
+    if inverse_weight <= CONTACT_EPSILON || bodies[attachment.body].fixed {
+        return false;
     }
 
     apply_attachment_position_delta(bodies, attachment, normal, penetration / inverse_weight);
+    true
 }
 
 fn apply_attachment_position_delta(
@@ -4578,26 +4662,129 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn parallel_cylinder_passes_match_sequential_body_order() {
+    fn body_major_cylinder_passes_match_pass_major_order_exactly() {
         simulation_task_pool_options().create_default_pools();
 
-        let mut simulation =
-            NetSimulation::with_grid_size(DemoScene::CylinderDrape, GRID_SIZE_OPTIONS[2]);
-        for _ in 0..20 {
-            simulation.step(1.0 / DEFAULT_FIXED_HZ);
-        }
-        let cylinder = simulation.cylinder.unwrap();
-        let previous_positions = simulation.previous_positions;
-        let mut parallel = simulation.bodies.clone();
-        let mut sequential = simulation.bodies;
+        for grid_size in GRID_SIZE_OPTIONS {
+            let mut simulation = NetSimulation::with_grid_size(DemoScene::CylinderDrape, grid_size);
+            for _ in 0..20 {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+            }
+            let cylinder = simulation.cylinder.unwrap();
+            let previous_positions = simulation.previous_positions;
+            let mut body_major = simulation.bodies.clone();
+            let mut pass_major = simulation.bodies;
 
-        project_cylinder_contact_passes(&mut parallel, &previous_positions, cylinder);
-        for _ in 0..CONTACT_PASSES {
-            project_cylinder_contacts(&mut sequential, &previous_positions, cylinder);
-        }
+            project_cylinder_contact_passes(&mut body_major, &previous_positions, cylinder);
+            project_cylinder_contact_passes_pass_major_reference(
+                &mut pass_major,
+                &previous_positions,
+                cylinder,
+            );
 
-        for (parallel, sequential) in parallel.iter().zip(sequential) {
-            assert_eq!(parallel.positions, sequential.positions);
+            for (body_major, pass_major) in body_major.iter().zip(pass_major) {
+                assert_eq!(body_major.positions, pass_major.positions);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn body_major_cylinder_passes_preserve_full_trajectory_exactly() {
+        simulation_task_pool_options().create_default_pools();
+        let dt = 1.0 / DEFAULT_FIXED_HZ;
+
+        for grid_size in GRID_SIZE_OPTIONS {
+            let mut body_major = NetSimulation::with_grid_size(DemoScene::CylinderDrape, grid_size);
+            let mut pass_major = NetSimulation::with_grid_size(DemoScene::CylinderDrape, grid_size);
+
+            for step in 0..30 {
+                body_major.step(dt);
+                pass_major.step_with_pass_major_cylinder_contacts(dt);
+
+                assert_eq!(
+                    body_major.previous_positions, pass_major.previous_positions,
+                    "previous-position mismatch for {grid_size}x{grid_size} at step {step}"
+                );
+                for (body_major, pass_major) in body_major.bodies.iter().zip(&pass_major.bodies) {
+                    assert_eq!(
+                        body_major.positions, pass_major.positions,
+                        "position mismatch for {grid_size}x{grid_size} at step {step}"
+                    );
+                    assert_eq!(
+                        body_major.predicted_positions, pass_major.predicted_positions,
+                        "prediction mismatch for {grid_size}x{grid_size} at step {step}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "performance comparison for cylinder pass ordering"]
+    fn compare_cylinder_pass_order_step_time() {
+        simulation_task_pool_options().create_default_pools();
+        let dt = 1.0 / DEFAULT_FIXED_HZ;
+
+        for grid_size in [25, 50, 100] {
+            let measured_steps = match grid_size {
+                25 => 10,
+                50 => 6,
+                _ => 3,
+            };
+            let mut body_major = NetSimulation::with_grid_size(DemoScene::CylinderDrape, grid_size);
+            let mut pass_major = NetSimulation::with_grid_size(DemoScene::CylinderDrape, grid_size);
+            for _ in 0..20 {
+                body_major.step(dt);
+                pass_major.step_with_pass_major_cylinder_contacts(dt);
+            }
+
+            let mut body_major_samples = Vec::with_capacity(11);
+            let mut pass_major_samples = Vec::with_capacity(11);
+            for batch in 0..11 {
+                let measure_body_major = |simulation: &mut NetSimulation| {
+                    let start = Instant::now();
+                    for _ in 0..measured_steps {
+                        simulation.step(dt);
+                    }
+                    start.elapsed().as_secs_f64() * 1_000.0 / measured_steps as f64
+                };
+                let measure_pass_major = |simulation: &mut NetSimulation| {
+                    let start = Instant::now();
+                    for _ in 0..measured_steps {
+                        simulation.step_with_pass_major_cylinder_contacts(dt);
+                    }
+                    start.elapsed().as_secs_f64() * 1_000.0 / measured_steps as f64
+                };
+
+                let (body_major_ms, pass_major_ms) = if batch % 2 == 0 {
+                    (
+                        measure_body_major(&mut body_major),
+                        measure_pass_major(&mut pass_major),
+                    )
+                } else {
+                    let pass_major_ms = measure_pass_major(&mut pass_major);
+                    let body_major_ms = measure_body_major(&mut body_major);
+                    (body_major_ms, pass_major_ms)
+                };
+                body_major_samples.push(body_major_ms);
+                pass_major_samples.push(pass_major_ms);
+                assert_eq!(body_major.previous_positions, pass_major.previous_positions);
+                for (body_major, pass_major) in body_major.bodies.iter().zip(&pass_major.bodies) {
+                    assert_eq!(body_major.positions, pass_major.positions);
+                }
+            }
+
+            body_major_samples.sort_by(f64::total_cmp);
+            pass_major_samples.sort_by(f64::total_cmp);
+            let body_major_ms = body_major_samples[body_major_samples.len() / 2];
+            let pass_major_ms = pass_major_samples[pass_major_samples.len() / 2];
+            let change_percent = (body_major_ms / pass_major_ms - 1.0) * 100.0;
+            println!(
+                "CYLINDER_PASS_TIME grid={grid_size} body_major_ms={body_major_ms:.4} \
+                 pass_major_ms={pass_major_ms:.4} change_percent={change_percent:.2}"
+            );
         }
     }
 
