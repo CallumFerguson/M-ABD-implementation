@@ -204,19 +204,26 @@ impl AffineBody {
     fn project_corotated_shape_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self) {
         match self.kind {
             BodyKind::Hub { .. } => self.project_hub_shape(),
-            BodyKind::Rod => self.project_rod_shape::<POLAR_ITERATIONS, true>(),
+            BodyKind::Rod => self.project_rod_shape::<POLAR_ITERATIONS, true, true>(),
             BodyKind::Ball => self.project_ball_shape(),
         }
     }
 
     #[inline]
-    fn project_rod_shape<const POLAR_ITERATIONS: usize, const DIVISION_FREE_FINAL: bool>(
+    fn project_rod_shape<
+        const POLAR_ITERATIONS: usize,
+        const DIVISION_FREE_FINAL: bool,
+        const FUSED_GEOMETRY: bool,
+    >(
         &mut self,
     ) {
-        let center = self.centroid();
         let prediction_weight = self.inertia * self.inverse_diagonal;
         let shape_weight = AFFINE_STIFFNESS * self.inverse_diagonal;
-        let gradient = rod_deformation_gradient(&self.positions);
+        let (center, gradient) = if FUSED_GEOMETRY {
+            rod_center_and_deformation_gradient(&self.positions)
+        } else {
+            (self.centroid(), rod_deformation_gradient(&self.positions))
+        };
         let rotation = if DIVISION_FREE_FINAL {
             closest_rotation_with_iterations::<POLAR_ITERATIONS>(gradient)
         } else {
@@ -293,7 +300,11 @@ impl AffineBody {
     }
 }
 
-fn project_corotated_shapes<const POLAR_ITERATIONS: usize, const DIVISION_FREE_FINAL: bool>(
+fn project_corotated_shapes<
+    const POLAR_ITERATIONS: usize,
+    const DIVISION_FREE_FINAL: bool,
+    const FUSED_ROD_GEOMETRY: bool,
+>(
     bodies: &mut [AffineBody],
     grid_size: usize,
     projected_hub_center: &mut [DVec3],
@@ -328,7 +339,11 @@ fn project_corotated_shapes<const POLAR_ITERATIONS: usize, const DIVISION_FREE_F
                         for (body, endpoints) in
                             chunk.iter_mut().zip(endpoint_chunk.chunks_exact_mut(2))
                         {
-                            body.project_rod_shape::<POLAR_ITERATIONS, DIVISION_FREE_FINAL>();
+                            body.project_rod_shape::<
+                                POLAR_ITERATIONS,
+                                DIVISION_FREE_FINAL,
+                                FUSED_ROD_GEOMETRY,
+                            >();
                             endpoints.copy_from_slice(&rod_joint_endpoints(&body.positions));
                         }
                     });
@@ -360,7 +375,7 @@ fn project_corotated_shapes<const POLAR_ITERATIONS: usize, const DIVISION_FREE_F
         .iter_mut()
         .zip(projected_rod_endpoints.chunks_exact_mut(2))
     {
-        rod.project_rod_shape::<POLAR_ITERATIONS, DIVISION_FREE_FINAL>();
+        rod.project_rod_shape::<POLAR_ITERATIONS, DIVISION_FREE_FINAL, FUSED_ROD_GEOMETRY>();
         endpoints.copy_from_slice(&rod_joint_endpoints(&rod.positions));
     }
     for ball in balls {
@@ -585,23 +600,29 @@ impl NetSimulation {
     }
 
     fn step_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self, dt: f64) {
-        self.step_with_joint_projection::<POLAR_ITERATIONS, true, true>(dt);
+        self.step_with_joint_projection::<POLAR_ITERATIONS, true, true, true>(dt);
     }
 
     #[cfg(test)]
     fn step_with_dual_projection(&mut self, dt: f64) {
-        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, false, true>(dt);
+        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, false, true, true>(dt);
     }
 
     #[cfg(test)]
     fn step_with_divisive_final_polar_round(&mut self, dt: f64) {
-        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, true, false>(dt);
+        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, true, false, true>(dt);
+    }
+
+    #[cfg(test)]
+    fn step_with_legacy_rod_geometry(&mut self, dt: f64) {
+        self.step_with_joint_projection::<POLAR_NEWTON_ITERATIONS, true, true, false>(dt);
     }
 
     fn step_with_joint_projection<
         const POLAR_ITERATIONS: usize,
         const DIRECT: bool,
         const DIVISION_FREE_FINAL: bool,
+        const FUSED_ROD_GEOMETRY: bool,
     >(
         &mut self,
         dt: f64,
@@ -622,7 +643,7 @@ impl NetSimulation {
         }
 
         for _ in 0..COROTATED_ITERATIONS {
-            project_corotated_shapes::<POLAR_ITERATIONS, DIVISION_FREE_FINAL>(
+            project_corotated_shapes::<POLAR_ITERATIONS, DIVISION_FREE_FINAL, FUSED_ROD_GEOMETRY>(
                 &mut self.bodies,
                 self.grid_size,
                 &mut self.solver_scratch.hub_weighted_residual,
@@ -2840,6 +2861,25 @@ fn rod_joint_endpoints(points: &[DVec3; 4]) -> [DVec3; 2] {
     ]
 }
 
+#[inline]
+fn rod_center_and_deformation_gradient(points: &[DVec3; 4]) -> (DVec3, DMat3) {
+    let point_01 = points[0] + points[1];
+    let point_23 = points[2] + points[3];
+    let difference_01 = points[1] - points[0];
+    let difference_23 = points[3] - points[2];
+    let inverse_four_half_length = 1.0 / (2.0 * GRID_SPACING);
+    let inverse_four_radius = 1.0 / (2.0 * ROD_THICKNESS as f64);
+
+    (
+        (point_01 + point_23) * 0.25,
+        DMat3::from_cols(
+            (point_23 - point_01) * inverse_four_half_length,
+            (difference_01 + difference_23) * inverse_four_radius,
+            (difference_01 - difference_23) * inverse_four_radius,
+        ),
+    )
+}
+
 fn rod_deformation_gradient(points: &[DVec3; 4]) -> DMat3 {
     let inverse_four_half_length = 1.0 / (2.0 * GRID_SPACING);
     let inverse_four_radius = 1.0 / (2.0 * ROD_THICKNESS as f64);
@@ -3318,7 +3358,7 @@ mod tests {
             let mut hub_centers = vec![DVec3::ZERO; hub_count];
             let mut rod_endpoints = vec![DVec3::ZERO; rod_count * 2];
 
-            project_corotated_shapes::<POLAR_NEWTON_ITERATIONS, true>(
+            project_corotated_shapes::<POLAR_NEWTON_ITERATIONS, true, true>(
                 &mut simulation.bodies,
                 simulation.grid_size,
                 &mut hub_centers,
@@ -3456,13 +3496,13 @@ mod tests {
                     SolverScratch::new(cached_bodies.len(), &simulation.joints, hub_count);
                 let mut residual_scratch =
                     SolverScratch::new(residual_bodies.len(), &simulation.joints, hub_count);
-                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS, true>(
+                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS, true, true>(
                     &mut cached_bodies,
                     grid_size,
                     &mut cached_scratch.hub_weighted_residual,
                     &mut cached_scratch.constraint_residual,
                 );
-                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS, true>(
+                project_corotated_shapes::<POLAR_NEWTON_ITERATIONS, true, true>(
                     &mut residual_bodies,
                     grid_size,
                     &mut residual_scratch.hub_weighted_residual,
@@ -4427,6 +4467,94 @@ mod tests {
             assert!(
                 maximum_error < 1.0e-11,
                 "{} specialized rod gradient error: {maximum_error}",
+                scene.title()
+            );
+        }
+    }
+
+    #[test]
+    fn fused_rod_geometry_preserves_legacy_trajectory() {
+        let mut maximum_center_error = 0.0_f64;
+        let mut maximum_gradient_error = 0.0_f64;
+        for grid_size in [10, 25, 50, 100] {
+            for scene in [
+                DemoScene::JointGrid,
+                DemoScene::CylinderDrape,
+                DemoScene::FallingBalls,
+            ] {
+                let mut simulation = NetSimulation::with_grid_size(scene, grid_size);
+                for step in 0..=20 {
+                    if matches!(step, 0 | 20) {
+                        let hub_count = grid_size * grid_size;
+                        let rod_count = simulation.joints.len() / 2;
+                        for rod in &simulation.bodies[hub_count..hub_count + rod_count] {
+                            let (center, gradient) =
+                                rod_center_and_deformation_gradient(&rod.positions);
+                            maximum_center_error = maximum_center_error
+                                .max((center - centroid(&rod.positions)).length());
+                            maximum_gradient_error = maximum_gradient_error.max(
+                                gradient
+                                    .to_cols_array()
+                                    .into_iter()
+                                    .zip(rod_deformation_gradient(&rod.positions).to_cols_array())
+                                    .map(|(fused, legacy)| (fused - legacy).abs())
+                                    .fold(0.0_f64, f64::max),
+                            );
+                        }
+                    }
+                    if step < 20 {
+                        simulation.step(1.0 / DEFAULT_FIXED_HZ);
+                    }
+                }
+            }
+        }
+        assert!(
+            maximum_center_error < 5.0e-14,
+            "fused rod center error: {maximum_center_error}"
+        );
+        assert!(
+            maximum_gradient_error < 5.0e-14,
+            "fused rod gradient error: {maximum_gradient_error}"
+        );
+
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut fused = NetSimulation::new(scene);
+            let mut legacy = NetSimulation::new(scene);
+            for _ in 0..150 {
+                fused.step(1.0 / DEFAULT_FIXED_HZ);
+                legacy.step_with_legacy_rod_geometry(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let mut squared_error_sum = 0.0;
+            let mut point_count = 0;
+            let mut maximum_error = 0.0_f64;
+            for (fused_body, legacy_body) in fused.bodies.iter().zip(&legacy.bodies) {
+                for (fused_point, legacy_point) in
+                    fused_body.positions.iter().zip(legacy_body.positions)
+                {
+                    let error = (*fused_point - legacy_point).length();
+                    squared_error_sum += error * error;
+                    point_count += 1;
+                    maximum_error = maximum_error.max(error);
+                }
+            }
+            let rms_error = (squared_error_sum / point_count as f64).sqrt();
+            println!(
+                "FUSED_ROD_GEOMETRY_ERROR scene={} rms={rms_error:.3e} max={maximum_error:.3e}",
+                scene.number()
+            );
+            assert!(
+                rms_error < 1.0e-9,
+                "{} fused rod geometry RMS trajectory error: {rms_error}",
+                scene.title()
+            );
+            assert!(
+                maximum_error < 1.0e-8,
+                "{} fused rod geometry maximum trajectory error: {maximum_error}",
                 scene.title()
             );
         }
