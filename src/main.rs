@@ -2544,24 +2544,163 @@ fn solve_dual_direct(scratch: &mut SolverScratch, grid_size: usize) {
     }
 }
 
-fn project_joint_constraints_direct(
-    bodies: &mut [AffineBody],
-    scratch: &mut SolverScratch,
-    hub_count: usize,
+#[inline]
+fn gather_joint_residual_row<const HAS_UP: bool, const HAS_DOWN: bool>(
+    horizontal_endpoint_or_residual: &mut [DVec3],
+    up_endpoint_or_residual: &mut [DVec3],
+    down_endpoint_or_residual: &mut [DVec3],
+    hub_center_or_delta: &mut [DVec3],
+    hub_delta_scale: &[f64],
+) {
+    let grid_size = hub_center_or_delta.len();
+    debug_assert!(grid_size >= 2);
+    debug_assert_eq!(horizontal_endpoint_or_residual.len(), 2 * (grid_size - 1));
+    debug_assert!(!HAS_UP || up_endpoint_or_residual.len() == 2 * grid_size);
+    debug_assert!(!HAS_DOWN || down_endpoint_or_residual.len() == 2 * grid_size);
+    debug_assert_eq!(hub_delta_scale.len(), grid_size);
+
+    let mut horizontal_pairs = horizontal_endpoint_or_residual.chunks_exact_mut(2);
+    let mut up_pairs = up_endpoint_or_residual.chunks_exact_mut(2);
+    let mut down_pairs = down_endpoint_or_residual.chunks_exact_mut(2);
+
+    let first_center = hub_center_or_delta[0];
+    let first_horizontal_pair = horizontal_pairs
+        .next()
+        .expect("a joint row must contain a horizontal rod");
+    let right_residual = first_horizontal_pair[0] - first_center;
+    first_horizontal_pair[0] = right_residual;
+    let mut current_center = hub_center_or_delta[1];
+    let mut carried_left_residual = first_horizontal_pair[1] - current_center;
+    first_horizontal_pair[1] = carried_left_residual;
+
+    let mut residual_sum = DVec3::ZERO;
+    residual_sum += right_residual;
+    if HAS_UP {
+        let up_pair = up_pairs.next().expect("an upper rod must exist per hub");
+        let up_residual = up_pair[1] - first_center;
+        up_pair[1] = up_residual;
+        residual_sum += up_residual;
+    }
+    if HAS_DOWN {
+        let down_pair = down_pairs.next().expect("a lower rod must exist per hub");
+        let down_residual = down_pair[0] - first_center;
+        down_pair[0] = down_residual;
+        residual_sum += down_residual;
+    }
+    hub_center_or_delta[0] = residual_sum * hub_delta_scale[0];
+
+    for column in 1..grid_size - 1 {
+        let horizontal_pair = horizontal_pairs
+            .next()
+            .expect("a horizontal rod must exist between adjacent hubs");
+        let right_residual = horizontal_pair[0] - current_center;
+        horizontal_pair[0] = right_residual;
+        let next_center = hub_center_or_delta[column + 1];
+        let next_left_residual = horizontal_pair[1] - next_center;
+        horizontal_pair[1] = next_left_residual;
+
+        let mut residual_sum = DVec3::ZERO;
+        residual_sum += carried_left_residual;
+        residual_sum += right_residual;
+        if HAS_UP {
+            let up_pair = up_pairs.next().expect("an upper rod must exist per hub");
+            let up_residual = up_pair[1] - current_center;
+            up_pair[1] = up_residual;
+            residual_sum += up_residual;
+        }
+        if HAS_DOWN {
+            let down_pair = down_pairs.next().expect("a lower rod must exist per hub");
+            let down_residual = down_pair[0] - current_center;
+            down_pair[0] = down_residual;
+            residual_sum += down_residual;
+        }
+        hub_center_or_delta[column] = residual_sum * hub_delta_scale[column];
+        current_center = next_center;
+        carried_left_residual = next_left_residual;
+    }
+
+    let last_column = grid_size - 1;
+    let mut residual_sum = DVec3::ZERO;
+    residual_sum += carried_left_residual;
+    if HAS_UP {
+        let up_pair = up_pairs.next().expect("an upper rod must exist per hub");
+        let up_residual = up_pair[1] - current_center;
+        up_pair[1] = up_residual;
+        residual_sum += up_residual;
+    }
+    if HAS_DOWN {
+        let down_pair = down_pairs.next().expect("a lower rod must exist per hub");
+        let down_residual = down_pair[0] - current_center;
+        down_pair[0] = down_residual;
+        residual_sum += down_residual;
+    }
+    hub_center_or_delta[last_column] = residual_sum * hub_delta_scale[last_column];
+
+    debug_assert!(horizontal_pairs.next().is_none());
+    debug_assert!(!HAS_UP || up_pairs.next().is_none());
+    debug_assert!(!HAS_DOWN || down_pairs.next().is_none());
+}
+
+fn gather_joint_residuals_row_streaming(
+    endpoint_or_residual: &mut [DVec3],
+    hub_center_or_delta: &mut [DVec3],
+    hub_delta_scale: &[f64],
     grid_size: usize,
 ) {
-    debug_assert_eq!(hub_count, grid_size * grid_size);
-    let SolverScratch {
-        constraint_residual: endpoint_or_residual,
-        hub_weighted_residual: hub_center_or_delta,
-        hub_delta_scale,
-        ..
-    } = scratch;
-    let horizontal_rod_count = grid_size * (grid_size - 1);
-    let (hubs, non_hubs) = bodies.split_at_mut(hub_count);
-    let rod_count = endpoint_or_residual.len() / 2;
-    let rods = &mut non_hubs[..rod_count];
+    debug_assert!(grid_size >= 2);
+    debug_assert_eq!(hub_center_or_delta.len(), grid_size * grid_size);
+    debug_assert_eq!(hub_delta_scale.len(), grid_size * grid_size);
+    debug_assert_eq!(endpoint_or_residual.len(), 4 * grid_size * (grid_size - 1));
 
+    let horizontal_row_len = 2 * (grid_size - 1);
+    let vertical_row_len = 2 * grid_size;
+    let horizontal_endpoint_count = horizontal_row_len * grid_size;
+    let (horizontal, vertical) = endpoint_or_residual.split_at_mut(horizontal_endpoint_count);
+
+    gather_joint_residual_row::<false, true>(
+        &mut horizontal[..horizontal_row_len],
+        &mut [],
+        &mut vertical[..vertical_row_len],
+        &mut hub_center_or_delta[..grid_size],
+        &hub_delta_scale[..grid_size],
+    );
+
+    for row in 1..grid_size - 1 {
+        let horizontal_start = row * horizontal_row_len;
+        let hub_start = row * grid_size;
+        let (up_and_before, down_and_after) = vertical.split_at_mut(row * vertical_row_len);
+        let up = &mut up_and_before[(row - 1) * vertical_row_len..];
+        let down = &mut down_and_after[..vertical_row_len];
+        gather_joint_residual_row::<true, true>(
+            &mut horizontal[horizontal_start..horizontal_start + horizontal_row_len],
+            up,
+            down,
+            &mut hub_center_or_delta[hub_start..hub_start + grid_size],
+            &hub_delta_scale[hub_start..hub_start + grid_size],
+        );
+    }
+
+    let last_row = grid_size - 1;
+    let horizontal_start = last_row * horizontal_row_len;
+    let hub_start = last_row * grid_size;
+    let up_start = (last_row - 1) * vertical_row_len;
+    gather_joint_residual_row::<true, false>(
+        &mut horizontal[horizontal_start..horizontal_start + horizontal_row_len],
+        &mut vertical[up_start..up_start + vertical_row_len],
+        &mut [],
+        &mut hub_center_or_delta[hub_start..hub_start + grid_size],
+        &hub_delta_scale[hub_start..hub_start + grid_size],
+    );
+}
+
+#[cfg(test)]
+fn gather_joint_residuals_reference(
+    endpoint_or_residual: &mut [DVec3],
+    hub_center_or_delta: &mut [DVec3],
+    hub_delta_scale: &[f64],
+    grid_size: usize,
+) {
+    let horizontal_rod_count = grid_size * (grid_size - 1);
     for row in 0..grid_size {
         for column in 0..grid_size {
             let hub_index = row * grid_size + column;
@@ -2596,10 +2735,34 @@ fn project_joint_constraints_direct(
                 residual_sum += residual;
             }
 
-            let delta = residual_sum * hub_delta_scale[hub_index];
-            hub_center_or_delta[hub_index] = delta;
+            hub_center_or_delta[hub_index] = residual_sum * hub_delta_scale[hub_index];
         }
     }
+}
+
+fn project_joint_constraints_direct(
+    bodies: &mut [AffineBody],
+    scratch: &mut SolverScratch,
+    hub_count: usize,
+    grid_size: usize,
+) {
+    debug_assert_eq!(hub_count, grid_size * grid_size);
+    let SolverScratch {
+        constraint_residual: endpoint_or_residual,
+        hub_weighted_residual: hub_center_or_delta,
+        hub_delta_scale,
+        ..
+    } = scratch;
+    let (hubs, non_hubs) = bodies.split_at_mut(hub_count);
+    let rod_count = endpoint_or_residual.len() / 2;
+    let rods = &mut non_hubs[..rod_count];
+
+    gather_joint_residuals_row_streaming(
+        endpoint_or_residual,
+        hub_center_or_delta,
+        hub_delta_scale,
+        grid_size,
+    );
 
     let constraint_residual = endpoint_or_residual.as_slice();
     let hub_delta = hub_center_or_delta.as_slice();
@@ -2610,6 +2773,7 @@ fn project_joint_constraints_direct(
     {
         let thread_count = task_pool.thread_num();
         if thread_count > 1 {
+            let horizontal_rod_count = grid_size * (grid_size - 1);
             let hub_task_count = (thread_count / 3).max(1);
             let rod_task_count = thread_count.saturating_sub(hub_task_count).max(1);
             let hubs_per_task = hub_count.div_ceil(hub_task_count);
@@ -3258,6 +3422,21 @@ mod tests {
     use super::*;
 
     const STEP_TIME_GRID_ENV: &str = "STEP_TIME_GRID_SIZE";
+
+    fn dvec3_bits(value: DVec3) -> [u64; 3] {
+        [value.x.to_bits(), value.y.to_bits(), value.z.to_bits()]
+    }
+
+    fn assert_dvec3_slices_bit_exact(actual: &[DVec3], expected: &[DVec3], context: &str) {
+        assert_eq!(actual.len(), expected.len(), "{context} length");
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                dvec3_bits(actual),
+                dvec3_bits(expected),
+                "{context} at vector {index}"
+            );
+        }
+    }
 
     #[test]
     #[ignore = "performance check; run `cargo bench-scenes`"]
@@ -4010,6 +4189,123 @@ mod tests {
                 maximum_error <= 1.0e-12 * (1.0 + maximum_magnitude),
                 "{} direct solve residual: {maximum_error}",
                 scene.title()
+            );
+        }
+    }
+
+    #[test]
+    fn row_streaming_joint_gather_matches_reference_bit_exactly() {
+        for grid_size in [2, 3, 10, 25, 50, 100] {
+            let endpoint_count = 4 * grid_size * (grid_size - 1);
+            let hub_count = grid_size * grid_size;
+            let endpoint = (0..endpoint_count)
+                .map(|index| {
+                    DVec3::new(
+                        if index % 17 == 0 {
+                            -0.0
+                        } else {
+                            ((index * 13) % 53) as f64 * 0.03125 - 0.75
+                        },
+                        ((index * 29) % 71) as f64 * 0.015625 - 0.5,
+                        ((index * 43) % 89) as f64 * 0.0078125 - 0.25,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let hub_center = (0..hub_count)
+                .map(|index| {
+                    DVec3::new(
+                        ((index * 11) % 47) as f64 * 0.03125 - 0.5,
+                        if index % 19 == 0 {
+                            -0.0
+                        } else {
+                            ((index * 23) % 61) as f64 * 0.015625 - 0.375
+                        },
+                        ((index * 37) % 73) as f64 * 0.0078125 - 0.125,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let hub_delta_scale = (0..hub_count)
+                .map(|index| 0.125 + (index % 7) as f64 * 0.03125)
+                .collect::<Vec<_>>();
+
+            let mut row_streaming_endpoint = endpoint.clone();
+            let mut reference_endpoint = endpoint;
+            let mut row_streaming_hub = hub_center.clone();
+            let mut reference_hub = hub_center;
+            gather_joint_residuals_row_streaming(
+                &mut row_streaming_endpoint,
+                &mut row_streaming_hub,
+                &hub_delta_scale,
+                grid_size,
+            );
+            gather_joint_residuals_reference(
+                &mut reference_endpoint,
+                &mut reference_hub,
+                &hub_delta_scale,
+                grid_size,
+            );
+            assert_dvec3_slices_bit_exact(
+                &row_streaming_endpoint,
+                &reference_endpoint,
+                &format!("{grid_size}x{grid_size} synthetic endpoint residual"),
+            );
+            assert_dvec3_slices_bit_exact(
+                &row_streaming_hub,
+                &reference_hub,
+                &format!("{grid_size}x{grid_size} synthetic hub delta"),
+            );
+        }
+
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let mut simulation = NetSimulation::with_grid_size(scene, 25);
+            for _ in 0..8 {
+                simulation.step(1.0 / DEFAULT_FIXED_HZ);
+            }
+
+            let hub_count = simulation.grid_size * simulation.grid_size;
+            let mut projected_bodies = simulation.bodies.clone();
+            for body in &mut projected_bodies {
+                body.update_time_step_coefficients(1.0 / DEFAULT_FIXED_HZ);
+            }
+            let mut scratch =
+                SolverScratch::new(projected_bodies.len(), &simulation.joints, hub_count);
+            prepare_direct_joint_solver(&projected_bodies, &simulation.joints, &mut scratch);
+            project_corotated_shapes::<POLAR_NEWTON_ITERATIONS, true, true>(
+                &mut projected_bodies,
+                simulation.grid_size,
+                &mut scratch.hub_weighted_residual,
+                &mut scratch.constraint_residual,
+            );
+
+            let mut row_streaming_endpoint = scratch.constraint_residual.clone();
+            let mut reference_endpoint = scratch.constraint_residual;
+            let mut row_streaming_hub = scratch.hub_weighted_residual.clone();
+            let mut reference_hub = scratch.hub_weighted_residual;
+            gather_joint_residuals_row_streaming(
+                &mut row_streaming_endpoint,
+                &mut row_streaming_hub,
+                &scratch.hub_delta_scale,
+                simulation.grid_size,
+            );
+            gather_joint_residuals_reference(
+                &mut reference_endpoint,
+                &mut reference_hub,
+                &scratch.hub_delta_scale,
+                simulation.grid_size,
+            );
+            assert_dvec3_slices_bit_exact(
+                &row_streaming_endpoint,
+                &reference_endpoint,
+                &format!("{} live endpoint residual", scene.title()),
+            );
+            assert_dvec3_slices_bit_exact(
+                &row_streaming_hub,
+                &reference_hub,
+                &format!("{} live hub delta", scene.title()),
             );
         }
     }
