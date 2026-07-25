@@ -25,7 +25,9 @@ const POLAR_NEWTON_ITERATIONS: usize = 2;
 const CONTACT_PASSES: usize = 2;
 const DEMO_COUNT: usize = 3;
 #[cfg(not(target_arch = "wasm32"))]
-const PARALLEL_PROJECTION_BODY_THRESHOLD: usize = 4_000;
+const PARALLEL_PROJECTION_BODY_THRESHOLD: usize = 1_500;
+#[cfg(not(target_arch = "wasm32"))]
+const HIGH_TASK_PROJECTION_BODY_THRESHOLD: usize = 4_000;
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_CYLINDER_BODY_THRESHOLD: usize = 4_000;
 #[cfg(not(target_arch = "wasm32"))]
@@ -328,7 +330,12 @@ fn project_corotated_shapes<
         && let Some(task_pool) = ComputeTaskPool::try_get()
     {
         let worker_count = task_pool.thread_num();
-        let total_tasks = worker_count.saturating_mul(4);
+        let tasks_per_worker = if body_count < HIGH_TASK_PROJECTION_BODY_THRESHOLD {
+            2
+        } else {
+            4
+        };
+        let total_tasks = worker_count.saturating_mul(tasks_per_worker);
         let hub_tasks = worker_count.min(hubs.len()).max(1);
         let rod_tasks = total_tasks.saturating_sub(hub_tasks).min(rods.len()).max(1);
         if worker_count > 1 {
