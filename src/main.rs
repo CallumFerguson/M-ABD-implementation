@@ -130,7 +130,6 @@ struct AffineBody {
     kind: BodyKind,
     fixed: bool,
     positions: [DVec3; 4],
-    previous_positions: [DVec3; 4],
     predicted_positions: [DVec3; 4],
     inertia: f64,
     inverse_diagonal: f64,
@@ -150,7 +149,6 @@ impl AffineBody {
             kind,
             fixed,
             positions,
-            previous_positions: positions,
             predicted_positions: positions,
             inertia: 0.0,
             inverse_diagonal: 0.0,
@@ -180,22 +178,27 @@ impl AffineBody {
     }
 
     #[cfg(test)]
-    fn predict(&mut self, dt: f64) {
+    fn predict(&mut self, previous_positions: &mut [DVec3; 4], dt: f64) {
         self.update_time_step_coefficients(dt);
-        self.predict_positions(dt, 0.0);
+        self.predict_positions(previous_positions, dt, 0.0);
     }
 
-    fn predict_positions(&mut self, dt: f64, previous_velocity_scale: f64) {
+    fn predict_positions(
+        &mut self,
+        previous_positions: &mut [DVec3; 4],
+        dt: f64,
+        previous_velocity_scale: f64,
+    ) {
         if self.fixed {
-            self.previous_positions = self.positions;
+            *previous_positions = self.positions;
             self.predicted_positions = self.positions;
             return;
         }
 
         for index in 0..4 {
             let position = self.positions[index];
-            let velocity = (position - self.previous_positions[index]) * previous_velocity_scale;
-            self.previous_positions[index] = position;
+            let velocity = (position - previous_positions[index]) * previous_velocity_scale;
+            previous_positions[index] = position;
             self.predicted_positions[index] = position + velocity * dt + GRAVITY * (dt * dt);
             self.positions[index] = self.predicted_positions[index];
         }
@@ -423,6 +426,7 @@ struct NetSimulation {
     scene: DemoScene,
     grid_size: usize,
     bodies: Vec<AffineBody>,
+    previous_positions: Vec<[DVec3; 4]>,
     joints: Vec<BallJoint>,
     cylinder: Option<CylinderCollider>,
     ball_indices: Vec<usize>,
@@ -592,11 +596,13 @@ impl NetSimulation {
         debug_validate_direct_solver_topology(&bodies, &joints, grid_size);
         let hub_count = grid_size * grid_size;
         let solver_scratch = SolverScratch::new(bodies.len(), &joints, hub_count);
+        let previous_positions = bodies.iter().map(|body| body.positions).collect();
 
         Self {
             scene,
             grid_size,
             bodies,
+            previous_positions,
             joints,
             cylinder,
             ball_indices,
@@ -608,6 +614,13 @@ impl NetSimulation {
 
     fn step(&mut self, dt: f64) {
         self.step_with_polar_iterations::<POLAR_NEWTON_ITERATIONS>(dt);
+    }
+
+    #[cfg(test)]
+    fn predict_for_test(&mut self, dt: f64) {
+        for (body, previous_positions) in self.bodies.iter_mut().zip(&mut self.previous_positions) {
+            body.predict(previous_positions, dt);
+        }
     }
 
     fn step_with_polar_iterations<const POLAR_ITERATIONS: usize>(&mut self, dt: f64) {
@@ -649,8 +662,9 @@ impl NetSimulation {
             self.previous_velocity_scale = velocity_damping_for_dt(dt) / dt;
         }
 
-        for body in &mut self.bodies {
-            body.predict_positions(dt, previous_velocity_scale);
+        debug_assert_eq!(self.bodies.len(), self.previous_positions.len());
+        for (body, previous_positions) in self.bodies.iter_mut().zip(&mut self.previous_positions) {
+            body.predict_positions(previous_positions, dt, previous_velocity_scale);
         }
 
         for _ in 0..COROTATED_ITERATIONS {
@@ -695,12 +709,14 @@ impl NetSimulation {
                 DemoScene::CylinderDrape => {
                     project_cylinder_contact_passes(
                         &mut self.bodies,
+                        &self.previous_positions,
                         self.cylinder.expect("cylinder scene must have a collider"),
                     );
                 }
                 DemoScene::FallingBalls => {
                     project_ball_contact_passes(
                         &mut self.bodies,
+                        &self.previous_positions,
                         &self.ball_indices,
                         &mut self.solver_scratch.contact_chunk_min,
                         &mut self.solver_scratch.contact_chunk_max,
@@ -1337,13 +1353,19 @@ fn add_rod(
     });
 }
 
-fn project_cylinder_contacts(bodies: &mut [AffineBody], cylinder: CylinderCollider) {
+fn project_cylinder_contacts(
+    bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
+    cylinder: CylinderCollider,
+) {
     debug_assert_eq!(cylinder.axis, DVec3::X);
+    debug_assert_eq!(bodies.len(), previous_positions.len());
 
     for body_index in 0..bodies.len() {
         match bodies[body_index].kind {
             BodyKind::Hub { .. } => project_attachment_against_cylinder(
                 bodies,
+                previous_positions,
                 Attachment {
                     body: body_index,
                     weights: HUB_CENTER,
@@ -1379,6 +1401,7 @@ fn project_cylinder_contacts(bodies: &mut [AffineBody], cylinder: CylinderCollid
                 if distance_squared < contact_distance * contact_distance {
                     project_penetrating_attachment_against_cylinder(
                         bodies,
+                        previous_positions,
                         interpolate_attachment(start, end, t),
                         radial,
                         distance_squared,
@@ -1392,7 +1415,12 @@ fn project_cylinder_contacts(bodies: &mut [AffineBody], cylinder: CylinderCollid
     }
 }
 
-fn project_cylinder_contact_passes(bodies: &mut [AffineBody], cylinder: CylinderCollider) {
+fn project_cylinder_contact_passes(
+    bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
+    cylinder: CylinderCollider,
+) {
+    debug_assert_eq!(bodies.len(), previous_positions.len());
     #[cfg(not(target_arch = "wasm32"))]
     if bodies.len() >= PARALLEL_CYLINDER_BODY_THRESHOLD
         && let Some(task_pool) = ComputeTaskPool::try_get()
@@ -1401,10 +1429,13 @@ fn project_cylinder_contact_passes(bodies: &mut [AffineBody], cylinder: Cylinder
         if task_count > 1 {
             let chunk_size = bodies.len().div_ceil(task_count);
             task_pool.scope(|scope| {
-                for chunk in bodies.chunks_mut(chunk_size) {
+                for (chunk, previous_chunk) in bodies
+                    .chunks_mut(chunk_size)
+                    .zip(previous_positions.chunks(chunk_size))
+                {
                     scope.spawn(async move {
                         for _ in 0..CONTACT_PASSES {
-                            project_cylinder_contacts(chunk, cylinder);
+                            project_cylinder_contacts(chunk, previous_chunk, cylinder);
                         }
                     });
                 }
@@ -1414,12 +1445,13 @@ fn project_cylinder_contact_passes(bodies: &mut [AffineBody], cylinder: Cylinder
     }
 
     for _ in 0..CONTACT_PASSES {
-        project_cylinder_contacts(bodies, cylinder);
+        project_cylinder_contacts(bodies, previous_positions, cylinder);
     }
 }
 
 fn project_attachment_against_cylinder(
     bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
     attachment: Attachment,
     proxy_radius: f64,
     cylinder_origin: DVec3,
@@ -1429,6 +1461,7 @@ fn project_attachment_against_cylinder(
     let radial = reject_from_x_axis(position - cylinder_origin);
     project_attachment_against_cylinder_at_radial(
         bodies,
+        previous_positions,
         attachment,
         radial,
         proxy_radius,
@@ -1439,6 +1472,7 @@ fn project_attachment_against_cylinder(
 
 fn project_attachment_against_cylinder_at_radial(
     bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
     attachment: Attachment,
     radial: DVec3,
     proxy_radius: f64,
@@ -1452,6 +1486,7 @@ fn project_attachment_against_cylinder_at_radial(
     }
     project_penetrating_attachment_against_cylinder(
         bodies,
+        previous_positions,
         attachment,
         radial,
         distance_squared,
@@ -1462,6 +1497,7 @@ fn project_attachment_against_cylinder_at_radial(
 
 fn project_penetrating_attachment_against_cylinder(
     bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
     attachment: Attachment,
     radial: DVec3,
     distance_squared: f64,
@@ -1473,7 +1509,7 @@ fn project_penetrating_attachment_against_cylinder(
     let normal = if distance_squared > CONTACT_EPSILON {
         radial / distance
     } else {
-        let previous = previous_attachment_position(bodies, attachment);
+        let previous = previous_attachment_position(previous_positions, attachment);
         let previous_radial = reject_from_x_axis(previous - cylinder_origin);
         safe_normal(radial, previous_radial, DVec3::Y)
     };
@@ -1481,7 +1517,11 @@ fn project_penetrating_attachment_against_cylinder(
 }
 
 #[cfg(test)]
-fn project_cylinder_contacts_reference(bodies: &mut [AffineBody], cylinder: CylinderCollider) {
+fn project_cylinder_contacts_reference(
+    bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
+    cylinder: CylinderCollider,
+) {
     let axis = cylinder.axis.normalize_or_zero();
     if axis.length_squared() <= CONTACT_EPSILON {
         return;
@@ -1524,7 +1564,7 @@ fn project_cylinder_contacts_reference(bodies: &mut [AffineBody], cylinder: Cyli
             continue;
         }
         let distance = distance_squared.sqrt();
-        let previous = previous_attachment_position(bodies, attachment);
+        let previous = previous_attachment_position(previous_positions, attachment);
         let previous_radial = reject_from_axis(previous - cylinder.origin, axis);
         let normal = safe_normal(radial, previous_radial, perpendicular_to(axis));
         project_static_attachment(bodies, attachment, normal, contact_distance - distance);
@@ -1533,32 +1573,50 @@ fn project_cylinder_contacts_reference(bodies: &mut [AffineBody], cylinder: Cyli
 
 fn project_ball_contact_passes(
     bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
     ball_indices: &[usize],
     chunk_min: &mut [DVec3],
     chunk_max: &mut [DVec3],
 ) {
     for pass in 0..CONTACT_PASSES {
-        project_ball_pairs(bodies, ball_indices);
+        project_ball_pairs(bodies, previous_positions, ball_indices);
         if pass == 0 {
             rebuild_ball_contact_chunk_bounds(bodies, ball_indices, chunk_min, chunk_max);
         }
-        project_balls_against_chunked_net(bodies, ball_indices, chunk_min, chunk_max);
+        project_balls_against_chunked_net(
+            bodies,
+            previous_positions,
+            ball_indices,
+            chunk_min,
+            chunk_max,
+        );
     }
 }
 
 #[cfg(test)]
 fn project_ball_contacts(
     bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
     ball_indices: &[usize],
     chunk_min: &mut [DVec3],
     chunk_max: &mut [DVec3],
 ) {
-    project_ball_pairs(bodies, ball_indices);
+    project_ball_pairs(bodies, previous_positions, ball_indices);
     rebuild_ball_contact_chunk_bounds(bodies, ball_indices, chunk_min, chunk_max);
-    project_balls_against_chunked_net(bodies, ball_indices, chunk_min, chunk_max);
+    project_balls_against_chunked_net(
+        bodies,
+        previous_positions,
+        ball_indices,
+        chunk_min,
+        chunk_max,
+    );
 }
 
-fn project_ball_pairs(bodies: &mut [AffineBody], ball_indices: &[usize]) {
+fn project_ball_pairs(
+    bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
+    ball_indices: &[usize],
+) {
     for first in 0..ball_indices.len() {
         for second in (first + 1)..ball_indices.len() {
             let a = Attachment {
@@ -1574,7 +1632,14 @@ fn project_ball_pairs(bodies: &mut [AffineBody], ball_indices: &[usize]) {
                 1 => DVec3::Y,
                 _ => DVec3::Z,
             };
-            project_attachment_pair(bodies, a, b, BALL_RADIUS as f64 * 2.0, fallback);
+            project_attachment_pair(
+                bodies,
+                previous_positions,
+                a,
+                b,
+                BALL_RADIUS as f64 * 2.0,
+                fallback,
+            );
         }
     }
 }
@@ -1680,6 +1745,7 @@ fn rebuild_ball_contact_chunk_bounds_reference(
 
 fn project_balls_against_chunked_net(
     bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
     ball_indices: &[usize],
     chunk_min: &mut [DVec3],
     chunk_max: &mut [DVec3],
@@ -1712,6 +1778,7 @@ fn project_balls_against_chunked_net(
                 let contact_applied = match bodies[net_body_index].kind {
                     BodyKind::Hub { .. } => project_attachment_pair_at_positions(
                         bodies,
+                        previous_positions,
                         ball_center,
                         Attachment {
                             body: net_body_index,
@@ -1745,6 +1812,7 @@ fn project_balls_against_chunked_net(
 
                         project_attachment_pair_at_positions(
                             bodies,
+                            previous_positions,
                             ball_center,
                             rod_attachment,
                             sphere_position,
@@ -1858,21 +1926,32 @@ fn rebuild_ball_contact_detailed_chunk_bounds(
 #[cfg(test)]
 fn project_ball_contact_passes_detailed_bounds_reference(
     bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
     ball_indices: &[usize],
     chunk_min: &mut [DVec3],
     chunk_max: &mut [DVec3],
 ) {
     for pass in 0..CONTACT_PASSES {
-        project_ball_pairs(bodies, ball_indices);
+        project_ball_pairs(bodies, previous_positions, ball_indices);
         if pass == 0 {
             rebuild_ball_contact_detailed_chunk_bounds(bodies, ball_indices, chunk_min, chunk_max);
         }
-        project_balls_against_chunked_net(bodies, ball_indices, chunk_min, chunk_max);
+        project_balls_against_chunked_net(
+            bodies,
+            previous_positions,
+            ball_indices,
+            chunk_min,
+            chunk_max,
+        );
     }
 }
 
 #[cfg(test)]
-fn project_ball_contacts_uncached(bodies: &mut [AffineBody], ball_indices: &[usize]) {
+fn project_ball_contacts_uncached(
+    bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
+    ball_indices: &[usize],
+) {
     for first in 0..ball_indices.len() {
         for second in (first + 1)..ball_indices.len() {
             let a = Attachment {
@@ -1888,7 +1967,14 @@ fn project_ball_contacts_uncached(bodies: &mut [AffineBody], ball_indices: &[usi
                 1 => DVec3::Y,
                 _ => DVec3::Z,
             };
-            project_attachment_pair(bodies, a, b, BALL_RADIUS as f64 * 2.0, fallback);
+            project_attachment_pair(
+                bodies,
+                previous_positions,
+                a,
+                b,
+                BALL_RADIUS as f64 * 2.0,
+                fallback,
+            );
         }
     }
 
@@ -1903,6 +1989,7 @@ fn project_ball_contacts_uncached(bodies: &mut [AffineBody], ball_indices: &[usi
             match bodies[net_body_index].kind {
                 BodyKind::Hub { .. } => project_attachment_pair(
                     bodies,
+                    previous_positions,
                     ball_center,
                     Attachment {
                         body: net_body_index,
@@ -1927,6 +2014,7 @@ fn project_ball_contacts_uncached(bodies: &mut [AffineBody], ball_indices: &[usi
 
                     project_attachment_pair(
                         bodies,
+                        previous_positions,
                         ball_center,
                         interpolate_attachment(start, end, t),
                         BALL_RADIUS as f64 + ROD_THICKNESS as f64 * 0.5,
@@ -1941,6 +2029,7 @@ fn project_ball_contacts_uncached(bodies: &mut [AffineBody], ball_indices: &[usi
 
 fn project_attachment_pair(
     bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
     a: Attachment,
     b: Attachment,
     minimum_distance: f64,
@@ -1954,6 +2043,7 @@ fn project_attachment_pair(
     let b_position = attachment_position(bodies, b);
     let _ = project_attachment_pair_at_positions(
         bodies,
+        previous_positions,
         a,
         b,
         a_position,
@@ -1965,6 +2055,7 @@ fn project_attachment_pair(
 
 fn project_attachment_pair_at_positions(
     bodies: &mut [AffineBody],
+    previous_positions: &[[DVec3; 4]],
     a: Attachment,
     b: Attachment,
     a_position: DVec3,
@@ -1986,8 +2077,8 @@ fn project_attachment_pair_at_positions(
     let normal = if distance_squared > CONTACT_EPSILON {
         delta / distance
     } else {
-        let previous_delta =
-            previous_attachment_position(bodies, a) - previous_attachment_position(bodies, b);
+        let previous_delta = previous_attachment_position(previous_positions, a)
+            - previous_attachment_position(previous_positions, b);
         safe_normal(delta, previous_delta, fallback)
     };
     let a_inverse_weight = attachment_inverse_weight(bodies, a);
@@ -2059,11 +2150,11 @@ fn interpolate_attachment(a: Attachment, b: Attachment, t: f64) -> Attachment {
     }
 }
 
-fn previous_attachment_position(bodies: &[AffineBody], attachment: Attachment) -> DVec3 {
-    weighted_point(
-        &bodies[attachment.body].previous_positions,
-        attachment.weights,
-    )
+fn previous_attachment_position(
+    previous_positions: &[[DVec3; 4]],
+    attachment: Attachment,
+) -> DVec3 {
+    weighted_point(&previous_positions[attachment.body], attachment.weights)
 }
 
 #[cfg(test)]
@@ -3432,9 +3523,7 @@ mod tests {
 
         for scene in [DemoScene::JointGrid, DemoScene::FallingBalls] {
             let mut simulation = NetSimulation::with_grid_size(scene, 50);
-            for body in &mut simulation.bodies {
-                body.predict(1.0 / DEFAULT_FIXED_HZ);
-            }
+            simulation.predict_for_test(1.0 / DEFAULT_FIXED_HZ);
             let mut sequential = simulation.bodies.clone();
             for body in &mut sequential {
                 body.project_corotated_shape_with_polar_iterations::<POLAR_NEWTON_ITERATIONS>();
@@ -3474,9 +3563,7 @@ mod tests {
 
         let grid_size = GRID_SIZE_OPTIONS[3];
         let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, grid_size);
-        for body in &mut simulation.bodies {
-            body.predict(1.0 / DEFAULT_FIXED_HZ);
-        }
+        simulation.predict_for_test(1.0 / DEFAULT_FIXED_HZ);
         let mut parallel = vec![DVec3::ZERO; simulation.joints.len()];
         let mut sequential = vec![DVec3::ZERO; simulation.joints.len()];
         let hub_count = grid_size * grid_size;
@@ -3517,9 +3604,7 @@ mod tests {
         let grid_size = GRID_SIZE_OPTIONS[3];
         let hub_count = grid_size * grid_size;
         let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, grid_size);
-        for body in &mut simulation.bodies {
-            body.predict(1.0 / DEFAULT_FIXED_HZ);
-        }
+        simulation.predict_for_test(1.0 / DEFAULT_FIXED_HZ);
         prepare_direct_joint_solver(
             &simulation.bodies,
             &simulation.joints,
@@ -3796,9 +3881,7 @@ mod tests {
             DemoScene::FallingBalls,
         ] {
             let mut simulation = NetSimulation::new(scene);
-            for body in &mut simulation.bodies {
-                body.predict(1.0 / DEFAULT_FIXED_HZ);
-            }
+            simulation.predict_for_test(1.0 / DEFAULT_FIXED_HZ);
             prepare_direct_joint_solver(
                 &simulation.bodies,
                 &simulation.joints,
@@ -3851,9 +3934,7 @@ mod tests {
     fn structured_hub_gather_matches_joint_scatter() {
         let grid_size = GRID_SIZE_OPTIONS[3];
         let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, grid_size);
-        for body in &mut simulation.bodies {
-            body.predict(1.0 / DEFAULT_FIXED_HZ);
-        }
+        simulation.predict_for_test(1.0 / DEFAULT_FIXED_HZ);
         prepare_direct_joint_solver(
             &simulation.bodies,
             &simulation.joints,
@@ -4032,9 +4113,7 @@ mod tests {
         let grid_size = GRID_SIZE_OPTIONS[1];
         let hub_count = grid_size * grid_size;
         let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, grid_size);
-        for body in &mut simulation.bodies {
-            body.predict(1.0 / DEFAULT_FIXED_HZ);
-        }
+        simulation.predict_for_test(1.0 / DEFAULT_FIXED_HZ);
         for (rod, body) in simulation.bodies[hub_count..].iter_mut().enumerate() {
             body.inverse_diagonal = 1.0e-5 + rod as f64 * 1.0e-10;
         }
@@ -4070,9 +4149,7 @@ mod tests {
     fn specialized_joint_correction_matches_generic_scatter() {
         for scene in [DemoScene::JointGrid, DemoScene::FallingBalls] {
             let mut simulation = NetSimulation::new(scene);
-            for body in &mut simulation.bodies {
-                body.predict(1.0 / DEFAULT_FIXED_HZ);
-            }
+            simulation.predict_for_test(1.0 / DEFAULT_FIXED_HZ);
 
             let multipliers = (0..simulation.joints.len())
                 .map(|index| {
@@ -4161,13 +4238,20 @@ mod tests {
             }
 
             let ball_indices = simulation.ball_indices.clone();
+            let previous_positions = simulation.previous_positions;
             let mut cached = simulation.bodies.clone();
             let mut uncached = simulation.bodies;
             let chunk_count = cached.len().div_ceil(CONTACT_PROXY_CHUNK_SIZE);
             let mut chunk_min = vec![DVec3::ZERO; chunk_count];
             let mut chunk_max = vec![DVec3::ZERO; chunk_count];
-            project_ball_contacts(&mut cached, &ball_indices, &mut chunk_min, &mut chunk_max);
-            project_ball_contacts_uncached(&mut uncached, &ball_indices);
+            project_ball_contacts(
+                &mut cached,
+                &previous_positions,
+                &ball_indices,
+                &mut chunk_min,
+                &mut chunk_max,
+            );
+            project_ball_contacts_uncached(&mut uncached, &previous_positions, &ball_indices);
 
             let maximum_error = cached
                 .iter()
@@ -4256,6 +4340,7 @@ mod tests {
             }
 
             let ball_indices = simulation.ball_indices.clone();
+            let previous_positions = simulation.previous_positions;
             let mut on_demand = simulation.bodies.clone();
             let mut detailed_bounds = simulation.bodies;
             let chunk_count = on_demand.len().div_ceil(CONTACT_PROXY_CHUNK_SIZE);
@@ -4266,12 +4351,14 @@ mod tests {
 
             project_ball_contact_passes(
                 &mut on_demand,
+                &previous_positions,
                 &ball_indices,
                 &mut on_demand_chunk_min,
                 &mut on_demand_chunk_max,
             );
             project_ball_contact_passes_detailed_bounds_reference(
                 &mut detailed_bounds,
+                &previous_positions,
                 &ball_indices,
                 &mut detailed_chunk_min,
                 &mut detailed_chunk_max,
@@ -4296,6 +4383,7 @@ mod tests {
             }
 
             let ball_indices = simulation.ball_indices.clone();
+            let previous_positions = simulation.previous_positions;
             let chunk_count = ball_indices[0].div_ceil(CONTACT_PROXY_CHUNK_SIZE);
             let minimum_sentinel = DVec3::splat(12_345.0);
             let maximum_sentinel = DVec3::splat(-54_321.0);
@@ -4322,16 +4410,18 @@ mod tests {
 
             let mut parallel_contacts = simulation.bodies.clone();
             let mut sequential_contacts = simulation.bodies;
-            project_ball_pairs(&mut parallel_contacts, &ball_indices);
-            project_ball_pairs(&mut sequential_contacts, &ball_indices);
+            project_ball_pairs(&mut parallel_contacts, &previous_positions, &ball_indices);
+            project_ball_pairs(&mut sequential_contacts, &previous_positions, &ball_indices);
             project_balls_against_chunked_net(
                 &mut parallel_contacts,
+                &previous_positions,
                 &ball_indices,
                 &mut parallel_min,
                 &mut parallel_max,
             );
             project_balls_against_chunked_net(
                 &mut sequential_contacts,
+                &previous_positions,
                 &ball_indices,
                 &mut sequential_min,
                 &mut sequential_max,
@@ -4353,6 +4443,7 @@ mod tests {
             }
 
             let ball_indices = simulation.ball_indices.clone();
+            let previous_positions = simulation.previous_positions;
             let mut reused = simulation.bodies.clone();
             let mut rebuilt = simulation.bodies;
             let chunk_count = reused.len().div_ceil(CONTACT_PROXY_CHUNK_SIZE);
@@ -4363,6 +4454,7 @@ mod tests {
 
             project_ball_contact_passes(
                 &mut reused,
+                &previous_positions,
                 &ball_indices,
                 &mut reused_chunk_min,
                 &mut reused_chunk_max,
@@ -4370,6 +4462,7 @@ mod tests {
             for _ in 0..CONTACT_PASSES {
                 project_ball_contacts(
                     &mut rebuilt,
+                    &previous_positions,
                     &ball_indices,
                     &mut rebuilt_chunk_min,
                     &mut rebuilt_chunk_max,
@@ -4411,12 +4504,22 @@ mod tests {
 
         let mut chunked = vec![hub, left_ball, right_ball];
         let mut uncached = chunked.clone();
+        let previous_positions = chunked
+            .iter()
+            .map(|body| body.positions)
+            .collect::<Vec<_>>();
         let initial_right_ball = chunked[2].centroid();
         let mut chunk_min = vec![DVec3::ZERO; 1];
         let mut chunk_max = vec![DVec3::ZERO; 1];
 
-        project_ball_contacts(&mut chunked, &[1, 2], &mut chunk_min, &mut chunk_max);
-        project_ball_contacts_uncached(&mut uncached, &[1, 2]);
+        project_ball_contacts(
+            &mut chunked,
+            &previous_positions,
+            &[1, 2],
+            &mut chunk_min,
+            &mut chunk_max,
+        );
+        project_ball_contacts_uncached(&mut uncached, &previous_positions, &[1, 2]);
 
         let maximum_error = chunked
             .iter()
@@ -4450,10 +4553,11 @@ mod tests {
         }
 
         let cylinder = simulation.cylinder.unwrap();
+        let previous_positions = simulation.previous_positions;
         let mut specialized = simulation.bodies.clone();
         let mut reference = simulation.bodies;
-        project_cylinder_contacts(&mut specialized, cylinder);
-        project_cylinder_contacts_reference(&mut reference, cylinder);
+        project_cylinder_contacts(&mut specialized, &previous_positions, cylinder);
+        project_cylinder_contacts_reference(&mut reference, &previous_positions, cylinder);
 
         let maximum_error = specialized
             .iter()
@@ -4483,12 +4587,13 @@ mod tests {
             simulation.step(1.0 / DEFAULT_FIXED_HZ);
         }
         let cylinder = simulation.cylinder.unwrap();
+        let previous_positions = simulation.previous_positions;
         let mut parallel = simulation.bodies.clone();
         let mut sequential = simulation.bodies;
 
-        project_cylinder_contact_passes(&mut parallel, cylinder);
+        project_cylinder_contact_passes(&mut parallel, &previous_positions, cylinder);
         for _ in 0..CONTACT_PASSES {
-            project_cylinder_contacts(&mut sequential, cylinder);
+            project_cylinder_contacts(&mut sequential, &previous_positions, cylinder);
         }
 
         for (parallel, sequential) in parallel.iter().zip(sequential) {
@@ -4542,7 +4647,9 @@ mod tests {
 
             let mut maximum_shape_error = 0.0_f64;
             let mut maximum_displacement_spread = 0.0_f64;
-            for body in &simulation.bodies {
+            for (body, previous_positions) in
+                simulation.bodies.iter().zip(&simulation.previous_positions)
+            {
                 if !matches!(body.kind, BodyKind::Hub { .. } | BodyKind::Ball) {
                     continue;
                 }
@@ -4552,8 +4659,8 @@ mod tests {
                 for index in 0..4 {
                     maximum_shape_error = maximum_shape_error
                         .max((body.positions[index] - center - rest_points[index]).length());
-                    let displacement = body.positions[index] - body.previous_positions[index];
-                    let first_displacement = body.positions[0] - body.previous_positions[0];
+                    let displacement = body.positions[index] - previous_positions[index];
+                    let first_displacement = body.positions[0] - previous_positions[0];
                     maximum_displacement_spread = maximum_displacement_spread
                         .max((displacement - first_displacement).length());
                 }
@@ -4802,6 +4909,24 @@ mod tests {
     }
 
     #[test]
+    fn previous_position_history_is_kept_out_of_hot_body_state() {
+        assert_eq!(std::mem::size_of::<AffineBody>(), 216);
+        for scene in [
+            DemoScene::JointGrid,
+            DemoScene::CylinderDrape,
+            DemoScene::FallingBalls,
+        ] {
+            let simulation = NetSimulation::new(scene);
+            assert_eq!(simulation.bodies.len(), simulation.previous_positions.len());
+            for (body, previous_positions) in
+                simulation.bodies.iter().zip(&simulation.previous_positions)
+            {
+                assert_eq!(body.positions, *previous_positions);
+            }
+        }
+    }
+
+    #[test]
     fn supported_fixed_rates_update_time_and_preserve_damping() {
         let expected_one_second_damping = VELOCITY_DAMPING_AT_DEFAULT_HZ.powf(DEFAULT_FIXED_HZ);
 
@@ -4828,6 +4953,8 @@ mod tests {
                 fixed,
             );
             let mut explicit = deferred.clone();
+            let mut deferred_previous_positions = deferred.positions;
+            let mut explicit_previous_positions;
             let mut explicit_velocity = [DVec3::ZERO; 4];
             let mut previous_velocity_scale = 0.0;
 
@@ -4835,9 +4962,13 @@ mod tests {
                 .into_iter()
                 .enumerate()
             {
-                deferred.predict_positions(dt, previous_velocity_scale);
+                deferred.predict_positions(
+                    &mut deferred_previous_positions,
+                    dt,
+                    previous_velocity_scale,
+                );
 
-                explicit.previous_positions = explicit.positions;
+                explicit_previous_positions = explicit.positions;
                 if fixed {
                     explicit.predicted_positions = explicit.positions;
                     explicit_velocity = [DVec3::ZERO; 4];
@@ -4850,7 +4981,7 @@ mod tests {
                 }
 
                 assert_eq!(deferred.positions, explicit.positions);
-                assert_eq!(deferred.previous_positions, explicit.previous_positions);
+                assert_eq!(deferred_previous_positions, explicit_previous_positions);
                 assert_eq!(deferred.predicted_positions, explicit.predicted_positions);
 
                 if !fixed {
@@ -4869,7 +5000,7 @@ mod tests {
                 if !fixed {
                     for (index, velocity) in explicit_velocity.iter_mut().enumerate() {
                         *velocity = (explicit.positions[index]
-                            - explicit.previous_positions[index])
+                            - explicit_previous_positions[index])
                             * previous_velocity_scale;
                     }
                 }
@@ -4894,10 +5025,6 @@ mod tests {
                 for (cached_body, rebuilt_body) in cached.bodies.iter().zip(&rebuilt.bodies) {
                     assert_eq!(cached_body.positions, rebuilt_body.positions);
                     assert_eq!(
-                        cached_body.previous_positions,
-                        rebuilt_body.previous_positions
-                    );
-                    assert_eq!(
                         cached_body.predicted_positions,
                         rebuilt_body.predicted_positions
                     );
@@ -4910,6 +5037,7 @@ mod tests {
                         rebuilt_body.inverse_diagonal.to_bits()
                     );
                 }
+                assert_eq!(cached.previous_positions, rebuilt.previous_positions);
                 assert_eq!(
                     cached.solver_scratch.rod_inverse_weight,
                     rebuilt.solver_scratch.rod_inverse_weight
@@ -4968,8 +5096,16 @@ mod tests {
             body: 1,
             weights: HUB_CENTER,
         };
+        let previous_positions = bodies.iter().map(|body| body.positions).collect::<Vec<_>>();
 
-        project_attachment_pair(&mut bodies, first, second, 1.0, DVec3::X);
+        project_attachment_pair(
+            &mut bodies,
+            &previous_positions,
+            first,
+            second,
+            1.0,
+            DVec3::X,
+        );
 
         let delta = attachment_position(&bodies, first) - attachment_position(&bodies, second);
         assert!((delta.length() - 1.0).abs() < 1.0e-10);
@@ -4986,8 +5122,9 @@ mod tests {
             length: 5.8,
         };
         let mut bodies = vec![test_body(DVec3::new(0.0, 0.2, 0.0), false)];
+        let previous_positions = bodies.iter().map(|body| body.positions).collect::<Vec<_>>();
 
-        project_cylinder_contacts(&mut bodies, cylinder);
+        project_cylinder_contacts(&mut bodies, &previous_positions, cylinder);
 
         let radial = reject_from_axis(bodies[0].centroid(), cylinder.axis).length();
         assert!((radial - (cylinder.radius + HUB_RADIUS as f64)).abs() < 1.0e-10);
@@ -5013,10 +5150,17 @@ mod tests {
             );
             ball.inverse_diagonal = 1.0;
             let mut bodies = vec![rod, ball];
+            let previous_positions = bodies.iter().map(|body| body.positions).collect::<Vec<_>>();
 
             let mut chunk_min = vec![DVec3::ZERO; 1];
             let mut chunk_max = vec![DVec3::ZERO; 1];
-            project_ball_contacts(&mut bodies, &[1], &mut chunk_min, &mut chunk_max);
+            project_ball_contacts(
+                &mut bodies,
+                &previous_positions,
+                &[1],
+                &mut chunk_min,
+                &mut chunk_max,
+            );
 
             let separation = sphere_rod_separation(&bodies, 1, 0);
             assert!(separation.abs() < 1.0e-10, "separation: {separation}");
@@ -5038,10 +5182,17 @@ mod tests {
                 body
             })
             .collect::<Vec<_>>();
+        let previous_positions = bodies.iter().map(|body| body.positions).collect::<Vec<_>>();
 
         let mut chunk_min = vec![DVec3::ZERO; 1];
         let mut chunk_max = vec![DVec3::ZERO; 1];
-        project_ball_contacts(&mut bodies, &[0, 1], &mut chunk_min, &mut chunk_max);
+        project_ball_contacts(
+            &mut bodies,
+            &previous_positions,
+            &[0, 1],
+            &mut chunk_min,
+            &mut chunk_max,
+        );
 
         let distance = (bodies[0].centroid() - bodies[1].centroid()).length();
         assert!(bodies.iter().all(|body| body.centroid().is_finite()));
@@ -5144,13 +5295,18 @@ mod tests {
     }
 
     fn simulation_is_finite(simulation: &NetSimulation) -> bool {
-        simulation.bodies.iter().all(|body| {
-            body.positions
+        simulation.bodies.len() == simulation.previous_positions.len()
+            && simulation
+                .bodies
                 .iter()
-                .chain(&body.previous_positions)
-                .chain(&body.predicted_positions)
-                .all(|value| value.is_finite())
-        })
+                .zip(&simulation.previous_positions)
+                .all(|(body, previous_positions)| {
+                    body.positions
+                        .iter()
+                        .chain(previous_positions)
+                        .chain(&body.predicted_positions)
+                        .all(|value| value.is_finite())
+                })
     }
 
     fn cylinder_proxy_separation(
