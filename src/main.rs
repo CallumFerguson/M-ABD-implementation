@@ -1,4 +1,6 @@
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::math::DVec2;
 use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
@@ -245,6 +247,17 @@ impl AffineBody {
                 unreachable!("the divisive final polar round is test-only")
             }
         };
+        self.project_rod_shape_from_rotation(center, rotation, prediction_weight, shape_weight);
+    }
+
+    #[inline]
+    fn project_rod_shape_from_rotation(
+        &mut self,
+        center: DVec3,
+        rotation: DMat3,
+        prediction_weight: f64,
+        shape_weight: f64,
+    ) {
         let half_length = GRID_SPACING * 0.5;
         let radius = ROD_THICKNESS as f64 * 0.5;
         let x = rotation.x_axis * half_length;
@@ -309,6 +322,85 @@ impl AffineBody {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn project_rod_shape_pair(
+    first: &mut AffineBody,
+    second: &mut AffineBody,
+    endpoints: &mut [DVec3],
+) {
+    debug_assert_eq!(endpoints.len(), 4);
+    let first_prediction_weight = first.inertia * first.inverse_diagonal;
+    let first_shape_weight = AFFINE_STIFFNESS * first.inverse_diagonal;
+    let second_prediction_weight = second.inertia * second.inverse_diagonal;
+    let second_shape_weight = AFFINE_STIFFNESS * second.inverse_diagonal;
+    let (first_center, first_gradient) = rod_center_and_deformation_gradient(&first.positions);
+    let (second_center, second_gradient) = rod_center_and_deformation_gradient(&second.positions);
+
+    if let Some((first_rotation, second_rotation)) =
+        closest_rotation_pair_2(first_gradient, second_gradient)
+    {
+        first.project_rod_shape_from_rotation(
+            first_center,
+            first_rotation,
+            first_prediction_weight,
+            first_shape_weight,
+        );
+        second.project_rod_shape_from_rotation(
+            second_center,
+            second_rotation,
+            second_prediction_weight,
+            second_shape_weight,
+        );
+    } else {
+        first.project_rod_shape::<2, true, true>();
+        second.project_rod_shape::<2, true, true>();
+    }
+
+    endpoints[..2].copy_from_slice(&rod_joint_endpoints(&first.positions));
+    endpoints[2..].copy_from_slice(&rod_joint_endpoints(&second.positions));
+}
+
+#[inline]
+fn project_rod_shapes<
+    const POLAR_ITERATIONS: usize,
+    const DIVISION_FREE_FINAL: bool,
+    const FUSED_ROD_GEOMETRY: bool,
+    const PAIR_ROD_POLAR: bool,
+>(
+    rods: &mut [AffineBody],
+    projected_rod_endpoints: &mut [DVec3],
+) {
+    debug_assert_eq!(projected_rod_endpoints.len(), rods.len() * 2);
+    #[cfg(not(target_arch = "wasm32"))]
+    if PAIR_ROD_POLAR && POLAR_ITERATIONS == 2 && DIVISION_FREE_FINAL && FUSED_ROD_GEOMETRY {
+        let paired_rod_count = rods.len() & !1;
+        let (paired_rods, tail_rods) = rods.split_at_mut(paired_rod_count);
+        let (paired_endpoints, tail_endpoints) =
+            projected_rod_endpoints.split_at_mut(paired_rod_count * 2);
+        for (rod_pair, endpoint_quad) in paired_rods
+            .chunks_exact_mut(2)
+            .zip(paired_endpoints.chunks_exact_mut(4))
+        {
+            let (first, second) = rod_pair.split_at_mut(1);
+            project_rod_shape_pair(&mut first[0], &mut second[0], endpoint_quad);
+        }
+        for (rod, endpoints) in tail_rods.iter_mut().zip(tail_endpoints.chunks_exact_mut(2)) {
+            rod.project_rod_shape::<POLAR_ITERATIONS, DIVISION_FREE_FINAL, FUSED_ROD_GEOMETRY>();
+            endpoints.copy_from_slice(&rod_joint_endpoints(&rod.positions));
+        }
+        return;
+    }
+
+    for (rod, endpoints) in rods
+        .iter_mut()
+        .zip(projected_rod_endpoints.chunks_exact_mut(2))
+    {
+        rod.project_rod_shape::<POLAR_ITERATIONS, DIVISION_FREE_FINAL, FUSED_ROD_GEOMETRY>();
+        endpoints.copy_from_slice(&rod_joint_endpoints(&rod.positions));
+    }
+}
+
 fn project_corotated_shapes<
     const POLAR_ITERATIONS: usize,
     const DIVISION_FREE_FINAL: bool,
@@ -343,23 +435,19 @@ fn project_corotated_shapes<
         let rod_tasks = total_tasks.saturating_sub(hub_tasks).min(rods.len()).max(1);
         if worker_count > 1 {
             let hub_chunk_size = hubs.len().div_ceil(hub_tasks);
-            let rod_chunk_size = rods.len().div_ceil(rod_tasks);
+            let rod_chunk_size = rods.len().div_ceil(rod_tasks).next_multiple_of(2);
             task_pool.scope(|scope| {
                 for (chunk, endpoint_chunk) in rods
                     .chunks_mut(rod_chunk_size)
                     .zip(projected_rod_endpoints.chunks_mut(rod_chunk_size * 2))
                 {
                     scope.spawn(async move {
-                        for (body, endpoints) in
-                            chunk.iter_mut().zip(endpoint_chunk.chunks_exact_mut(2))
-                        {
-                            body.project_rod_shape::<
-                                POLAR_ITERATIONS,
-                                DIVISION_FREE_FINAL,
-                                FUSED_ROD_GEOMETRY,
-                            >();
-                            endpoints.copy_from_slice(&rod_joint_endpoints(&body.positions));
-                        }
+                        project_rod_shapes::<
+                            POLAR_ITERATIONS,
+                            DIVISION_FREE_FINAL,
+                            FUSED_ROD_GEOMETRY,
+                            true,
+                        >(chunk, endpoint_chunk);
                     });
                 }
                 for (chunk, center_chunk) in hubs
@@ -385,13 +473,10 @@ fn project_corotated_shapes<
         hub.project_hub_shape();
         *center = hub_attachment_center(&hub.positions);
     }
-    for (rod, endpoints) in rods
-        .iter_mut()
-        .zip(projected_rod_endpoints.chunks_exact_mut(2))
-    {
-        rod.project_rod_shape::<POLAR_ITERATIONS, DIVISION_FREE_FINAL, FUSED_ROD_GEOMETRY>();
-        endpoints.copy_from_slice(&rod_joint_endpoints(&rod.positions));
-    }
+    project_rod_shapes::<POLAR_ITERATIONS, DIVISION_FREE_FINAL, FUSED_ROD_GEOMETRY, true>(
+        rods,
+        projected_rod_endpoints,
+    );
     for ball in balls {
         ball.project_ball_shape();
     }
@@ -3317,6 +3402,264 @@ fn rod_deformation_gradient(points: &[DVec3; 4]) -> DMat3 {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+struct DVec3x2 {
+    x: DVec2,
+    y: DVec2,
+    z: DVec2,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DVec3x2 {
+    #[inline(always)]
+    fn from_lanes(first: DVec3, second: DVec3) -> Self {
+        Self {
+            x: DVec2::new(first.x, second.x),
+            y: DVec2::new(first.y, second.y),
+            z: DVec2::new(first.z, second.z),
+        }
+    }
+
+    #[inline(always)]
+    fn lanes(self) -> (DVec3, DVec3) {
+        (
+            DVec3::new(self.x.x, self.y.x, self.z.x),
+            DVec3::new(self.x.y, self.y.y, self.z.y),
+        )
+    }
+
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            x: self.x + rhs.x,
+            y: self.y + rhs.y,
+            z: self.z + rhs.z,
+        }
+    }
+
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+            z: self.z - rhs.z,
+        }
+    }
+
+    #[inline(always)]
+    fn neg(self) -> Self {
+        Self {
+            x: -self.x,
+            y: -self.y,
+            z: -self.z,
+        }
+    }
+
+    #[inline(always)]
+    fn scale(self, scale: DVec2) -> Self {
+        Self {
+            x: self.x * scale,
+            y: self.y * scale,
+            z: self.z * scale,
+        }
+    }
+
+    #[inline(always)]
+    fn dot(self, rhs: Self) -> DVec2 {
+        (self.x * rhs.x) + (self.y * rhs.y) + (self.z * rhs.z)
+    }
+
+    #[inline(always)]
+    fn cross(self, rhs: Self) -> Self {
+        Self {
+            x: self.y * rhs.z - rhs.y * self.z,
+            y: self.z * rhs.x - rhs.z * self.x,
+            z: self.x * rhs.y - rhs.x * self.y,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+struct DMat3x2 {
+    x_axis: DVec3x2,
+    y_axis: DVec3x2,
+    z_axis: DVec3x2,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DMat3x2 {
+    #[inline(always)]
+    fn from_lanes(first: DMat3, second: DMat3) -> Self {
+        Self {
+            x_axis: DVec3x2::from_lanes(first.x_axis, second.x_axis),
+            y_axis: DVec3x2::from_lanes(first.y_axis, second.y_axis),
+            z_axis: DVec3x2::from_lanes(first.z_axis, second.z_axis),
+        }
+    }
+
+    #[inline(always)]
+    fn lanes(self) -> (DMat3, DMat3) {
+        let (first_x, second_x) = self.x_axis.lanes();
+        let (first_y, second_y) = self.y_axis.lanes();
+        let (first_z, second_z) = self.z_axis.lanes();
+        (
+            DMat3::from_cols(first_x, first_y, first_z),
+            DMat3::from_cols(second_x, second_y, second_z),
+        )
+    }
+
+    #[inline(always)]
+    fn determinant(self) -> DVec2 {
+        self.z_axis.dot(self.x_axis.cross(self.y_axis))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinalPolarBranch {
+    Skip,
+    Positive,
+    Negative,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+fn final_polar_branch(determinant: f64) -> Option<FinalPolarBranch> {
+    if !determinant.is_finite() {
+        None
+    } else if determinant.abs() <= 1.0e-12 {
+        Some(FinalPolarBranch::Skip)
+    } else if determinant > 0.0 {
+        Some(FinalPolarBranch::Positive)
+    } else {
+        Some(FinalPolarBranch::Negative)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+fn normalize_pair(vector: DVec3x2) -> Result<Option<DVec3x2>, ()> {
+    let length_squared = vector.dot(vector);
+    let length = DVec2::new(length_squared.x.sqrt(), length_squared.y.sqrt());
+    let reciprocal = DVec2::new(1.0 / length.x, 1.0 / length.y);
+    let first_valid = reciprocal.x.is_finite() && reciprocal.x > 0.0;
+    let second_valid = reciprocal.y.is_finite() && reciprocal.y > 0.0;
+    match (first_valid, second_valid) {
+        (true, true) => Ok(Some(vector.scale(reciprocal))),
+        (false, false) => Ok(None),
+        _ => Err(()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+fn orthonormalize_rotation_pair(rotation: DMat3x2) -> Option<DMat3x2> {
+    let x = match normalize_pair(rotation.x_axis) {
+        Ok(Some(x)) => x,
+        Ok(None) => {
+            return Some(DMat3x2::from_lanes(DMat3::IDENTITY, DMat3::IDENTITY));
+        }
+        Err(()) => return None,
+    };
+    let y_projection = x.scale(x.dot(rotation.y_axis));
+    let mut y = match normalize_pair(rotation.y_axis.sub(y_projection)) {
+        Ok(Some(y)) => y,
+        Ok(None) => {
+            return Some(DMat3x2::from_lanes(DMat3::IDENTITY, DMat3::IDENTITY));
+        }
+        Err(()) => return None,
+    };
+
+    let mut z = x.cross(y);
+    let orientation = z.dot(rotation.z_axis);
+    let first_flip = orientation.x < 0.0;
+    let second_flip = orientation.y < 0.0;
+    if first_flip != second_flip {
+        return None;
+    }
+    if first_flip {
+        z = z.neg();
+    }
+    y = z.cross(x);
+
+    Some(DMat3x2 {
+        x_axis: x,
+        y_axis: y,
+        z_axis: z,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+fn closest_rotation_pair_2(first: DMat3, second: DMat3) -> Option<(DMat3, DMat3)> {
+    let mut rotation = DMat3x2::from_lanes(first, second);
+    let determinant = rotation.determinant();
+    if !determinant.x.is_finite() || !determinant.y.is_finite() {
+        return None;
+    }
+    let first_continue = determinant.x.abs() > 1.0e-12;
+    let second_continue = determinant.y.abs() > 1.0e-12;
+    if first_continue != second_continue {
+        return None;
+    }
+
+    if first_continue {
+        let cofactor_x = rotation.y_axis.cross(rotation.z_axis);
+        let cofactor_y = rotation.z_axis.cross(rotation.x_axis);
+        let cofactor_z = rotation.x_axis.cross(rotation.y_axis);
+        let determinant = rotation.z_axis.dot(cofactor_z);
+        let inverse_determinant = DVec2::new(1.0 / determinant.x, 1.0 / determinant.y);
+        let half = DVec2::splat(0.5);
+        rotation = DMat3x2 {
+            x_axis: rotation
+                .x_axis
+                .add(cofactor_x.scale(inverse_determinant))
+                .scale(half),
+            y_axis: rotation
+                .y_axis
+                .add(cofactor_y.scale(inverse_determinant))
+                .scale(half),
+            z_axis: rotation
+                .z_axis
+                .add(cofactor_z.scale(inverse_determinant))
+                .scale(half),
+        };
+
+        let cofactor_z = rotation.x_axis.cross(rotation.y_axis);
+        let determinant = rotation.z_axis.dot(cofactor_z);
+        let first_branch = final_polar_branch(determinant.x)?;
+        let second_branch = final_polar_branch(determinant.y)?;
+        if first_branch != second_branch {
+            return None;
+        }
+        if first_branch != FinalPolarBranch::Skip {
+            let cofactor_x = rotation.y_axis.cross(rotation.z_axis);
+            let cofactor_y = rotation.z_axis.cross(rotation.x_axis);
+            let scale = DVec2::new(determinant.x.abs(), determinant.y.abs());
+            let scaled_x = rotation.x_axis.scale(scale);
+            let scaled_y = rotation.y_axis.scale(scale);
+            let scaled_z = rotation.z_axis.scale(scale);
+            rotation = if first_branch == FinalPolarBranch::Positive {
+                DMat3x2 {
+                    x_axis: scaled_x.add(cofactor_x),
+                    y_axis: scaled_y.add(cofactor_y),
+                    z_axis: scaled_z.add(cofactor_z),
+                }
+            } else {
+                DMat3x2 {
+                    x_axis: scaled_x.sub(cofactor_x),
+                    y_axis: scaled_y.sub(cofactor_y),
+                    z_axis: scaled_z.sub(cofactor_z),
+                }
+            };
+        }
+    }
+
+    orthonormalize_rotation_pair(rotation).map(DMat3x2::lanes)
+}
+
 fn closest_rotation(matrix: DMat3) -> DMat3 {
     closest_rotation_with_iterations::<POLAR_NEWTON_ITERATIONS>(matrix)
 }
@@ -3515,6 +3858,121 @@ mod tests {
             maximum_orthonormality_error < 2.0e-14,
             "optimized rotation orthonormality error: {maximum_orthonormality_error}"
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn paired_polar_matches_scalar_bit_exactly() {
+        fn assert_matrix_bits_eq(actual: DMat3, expected: DMat3, context: &str) {
+            for (component, (actual, expected)) in actual
+                .to_cols_array()
+                .into_iter()
+                .zip(expected.to_cols_array())
+                .enumerate()
+            {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{context} component {component}"
+                );
+            }
+        }
+
+        let rotation = DMat3::from_quat(
+            DQuat::from_rotation_x(0.37)
+                * DQuat::from_rotation_y(-0.61)
+                * DQuat::from_rotation_z(0.19),
+        );
+        let pairs = [
+            (
+                DMat3::IDENTITY,
+                DMat3::from_diagonal(DVec3::new(0.35, 1.7, 3.2)),
+            ),
+            (
+                rotation * DMat3::from_diagonal(DVec3::new(0.6, 1.4, 2.1)),
+                DMat3::from_cols(
+                    DVec3::new(1.0, 0.2, -0.1),
+                    DVec3::new(0.35, 0.9, 0.15),
+                    DVec3::new(-0.2, 0.1, 1.3),
+                ),
+            ),
+            (
+                DMat3::from_diagonal(DVec3::new(-1.0, 1.0, 1.0)),
+                rotation * DMat3::from_diagonal(DVec3::new(-0.8, 1.2, 1.6)),
+            ),
+            (DMat3::ZERO, DMat3::ZERO),
+            (
+                DMat3::from_diagonal(DVec3::splat(1.0e-14)),
+                DMat3::from_diagonal(DVec3::splat(1.0e-14)),
+            ),
+        ];
+
+        for (index, (first, second)) in pairs.into_iter().enumerate() {
+            let (paired_first, paired_second) = closest_rotation_pair_2(first, second)
+                .unwrap_or_else(|| panic!("pair {index} unexpectedly required fallback"));
+            assert_matrix_bits_eq(
+                paired_first,
+                closest_rotation_with_iterations::<2>(first),
+                &format!("pair {index} first lane"),
+            );
+            assert_matrix_bits_eq(
+                paired_second,
+                closest_rotation_with_iterations::<2>(second),
+                &format!("pair {index} second lane"),
+            );
+
+            let (swapped_second, swapped_first) = closest_rotation_pair_2(second, first)
+                .unwrap_or_else(|| panic!("swapped pair {index} unexpectedly required fallback"));
+            assert_matrix_bits_eq(
+                swapped_first,
+                paired_first,
+                &format!("pair {index} lane swap"),
+            );
+            assert_matrix_bits_eq(
+                swapped_second,
+                paired_second,
+                &format!("pair {index} lane swap"),
+            );
+        }
+
+        assert!(closest_rotation_pair_2(DMat3::IDENTITY, DMat3::ZERO).is_none());
+        assert!(
+            closest_rotation_pair_2(
+                DMat3::IDENTITY,
+                DMat3::from_diagonal(DVec3::new(-1.0, 1.0, 1.0)),
+            )
+            .is_none()
+        );
+        let nan_matrix = DMat3::from_cols(DVec3::NAN, DVec3::NAN, DVec3::NAN);
+        assert!(closest_rotation_pair_2(DMat3::IDENTITY, nan_matrix).is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn paired_rod_shape_projection_matches_scalar_bit_exactly() {
+        let mut simulation = NetSimulation::with_grid_size(DemoScene::JointGrid, 3);
+        simulation.predict_for_test(1.0 / DEFAULT_FIXED_HZ);
+        let hub_count = simulation.grid_size * simulation.grid_size;
+        let mut paired = simulation.bodies[hub_count..hub_count + 3].to_vec();
+        let collapsed = paired[1].positions[0];
+        paired[1].positions = [collapsed; 4];
+        let mut scalar = paired.clone();
+        let mut paired_endpoints = vec![DVec3::ZERO; 6];
+        let mut scalar_endpoints = vec![DVec3::ZERO; 6];
+
+        project_rod_shapes::<2, true, true, true>(&mut paired, &mut paired_endpoints);
+        project_rod_shapes::<2, true, true, false>(&mut scalar, &mut scalar_endpoints);
+
+        for (body_index, (paired, scalar)) in paired.iter().zip(scalar).enumerate() {
+            for point in 0..4 {
+                assert_eq!(
+                    dvec3_bits(paired.positions[point]),
+                    dvec3_bits(scalar.positions[point]),
+                    "body {body_index} point {point}"
+                );
+            }
+        }
+        assert_dvec3_slices_bit_exact(&paired_endpoints, &scalar_endpoints, "paired rod endpoints");
     }
 
     #[test]
