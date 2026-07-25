@@ -28,6 +28,10 @@ const DEMO_COUNT: usize = 3;
 const PARALLEL_PROJECTION_BODY_THRESHOLD: usize = 4_000;
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_CYLINDER_BODY_THRESHOLD: usize = 4_000;
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_BALL_BOUND_BODY_THRESHOLD: usize = 4_000;
+#[cfg(not(target_arch = "wasm32"))]
+const BALL_BOUND_BODIES_PER_TASK: usize = 1_024;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 const PARALLEL_JOINT_THRESHOLD: usize = 15_000;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1569,6 +1573,82 @@ fn project_ball_pairs(bodies: &mut [AffineBody], ball_indices: &[usize]) {
 }
 
 fn rebuild_ball_contact_chunk_bounds(
+    bodies: &[AffineBody],
+    ball_indices: &[usize],
+    chunk_min: &mut [DVec3],
+    chunk_max: &mut [DVec3],
+) {
+    let net_body_count = ball_indices.first().copied().unwrap_or(bodies.len());
+    let chunk_count = net_body_count.div_ceil(CONTACT_PROXY_CHUNK_SIZE);
+    debug_assert!(chunk_min.len() >= chunk_count);
+    debug_assert!(chunk_max.len() >= chunk_count);
+    let net_bodies = &bodies[..net_body_count];
+    let chunk_min = &mut chunk_min[..chunk_count];
+    let chunk_max = &mut chunk_max[..chunk_count];
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if net_body_count >= PARALLEL_BALL_BOUND_BODY_THRESHOLD
+        && let Some(task_pool) = ComputeTaskPool::try_get()
+    {
+        let task_count = task_pool
+            .thread_num()
+            .min(net_body_count.div_ceil(BALL_BOUND_BODIES_PER_TASK))
+            .min(chunk_count)
+            .max(1);
+        if task_count > 1 {
+            let chunks_per_task = chunk_count.div_ceil(task_count);
+            let bodies_per_task = chunks_per_task * CONTACT_PROXY_CHUNK_SIZE;
+            task_pool.scope(|scope| {
+                for ((body_chunk, minimum_chunk), maximum_chunk) in net_bodies
+                    .chunks(bodies_per_task)
+                    .zip(chunk_min.chunks_mut(chunks_per_task))
+                    .zip(chunk_max.chunks_mut(chunks_per_task))
+                {
+                    scope.spawn(async move {
+                        rebuild_ball_contact_chunk_bounds_sequential(
+                            body_chunk,
+                            minimum_chunk,
+                            maximum_chunk,
+                        );
+                    });
+                }
+            });
+            return;
+        }
+    }
+
+    rebuild_ball_contact_chunk_bounds_sequential(net_bodies, chunk_min, chunk_max);
+}
+
+fn rebuild_ball_contact_chunk_bounds_sequential(
+    bodies: &[AffineBody],
+    chunk_min: &mut [DVec3],
+    chunk_max: &mut [DVec3],
+) {
+    debug_assert_eq!(
+        chunk_min.len(),
+        bodies.len().div_ceil(CONTACT_PROXY_CHUNK_SIZE)
+    );
+    debug_assert_eq!(chunk_max.len(), chunk_min.len());
+    for ((body_chunk, minimum_output), maximum_output) in bodies
+        .chunks(CONTACT_PROXY_CHUNK_SIZE)
+        .zip(chunk_min)
+        .zip(chunk_max)
+    {
+        let mut minimum = DVec3::splat(f64::INFINITY);
+        let mut maximum = DVec3::splat(f64::NEG_INFINITY);
+        for body in body_chunk {
+            let (start, end) = broad_contact_proxy(body);
+            minimum = minimum.min(start).min(end);
+            maximum = maximum.max(start).max(end);
+        }
+        *minimum_output = minimum;
+        *maximum_output = maximum;
+    }
+}
+
+#[cfg(test)]
+fn rebuild_ball_contact_chunk_bounds_reference(
     bodies: &[AffineBody],
     ball_indices: &[usize],
     chunk_min: &mut [DVec3],
@@ -4192,6 +4272,67 @@ mod tests {
 
             for (on_demand, detailed_bounds) in on_demand.iter().zip(&detailed_bounds) {
                 assert_eq!(on_demand.positions, detailed_bounds.positions);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parallel_ball_contact_bounds_match_sequential_exactly() {
+        simulation_task_pool_options().create_default_pools();
+        let dt = 1.0 / DEFAULT_FIXED_HZ;
+        for grid_size in [10, 25, 50, 100] {
+            let mut simulation = NetSimulation::with_grid_size(DemoScene::FallingBalls, grid_size);
+
+            for _ in 0..30 {
+                simulation.step(dt);
+            }
+
+            let ball_indices = simulation.ball_indices.clone();
+            let chunk_count = ball_indices[0].div_ceil(CONTACT_PROXY_CHUNK_SIZE);
+            let minimum_sentinel = DVec3::splat(12_345.0);
+            let maximum_sentinel = DVec3::splat(-54_321.0);
+            let mut parallel_min = vec![minimum_sentinel; chunk_count + 2];
+            let mut parallel_max = vec![maximum_sentinel; chunk_count + 2];
+            let mut sequential_min = vec![minimum_sentinel; chunk_count + 2];
+            let mut sequential_max = vec![maximum_sentinel; chunk_count + 2];
+            rebuild_ball_contact_chunk_bounds(
+                &simulation.bodies,
+                &ball_indices,
+                &mut parallel_min,
+                &mut parallel_max,
+            );
+            rebuild_ball_contact_chunk_bounds_reference(
+                &simulation.bodies,
+                &ball_indices,
+                &mut sequential_min,
+                &mut sequential_max,
+            );
+            assert_eq!(parallel_min, sequential_min);
+            assert_eq!(parallel_max, sequential_max);
+            assert_eq!(parallel_min[chunk_count..], [minimum_sentinel; 2]);
+            assert_eq!(parallel_max[chunk_count..], [maximum_sentinel; 2]);
+
+            let mut parallel_contacts = simulation.bodies.clone();
+            let mut sequential_contacts = simulation.bodies;
+            project_ball_pairs(&mut parallel_contacts, &ball_indices);
+            project_ball_pairs(&mut sequential_contacts, &ball_indices);
+            project_balls_against_chunked_net(
+                &mut parallel_contacts,
+                &ball_indices,
+                &mut parallel_min,
+                &mut parallel_max,
+            );
+            project_balls_against_chunked_net(
+                &mut sequential_contacts,
+                &ball_indices,
+                &mut sequential_min,
+                &mut sequential_max,
+            );
+            for (parallel_body, sequential_body) in
+                parallel_contacts.iter().zip(&sequential_contacts)
+            {
+                assert_eq!(parallel_body.positions, sequential_body.positions);
             }
         }
     }
