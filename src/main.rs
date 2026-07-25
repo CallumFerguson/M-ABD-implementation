@@ -1,5 +1,4 @@
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
-#[cfg(not(target_arch = "wasm32"))]
 use bevy::math::DVec2;
 use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::platform::time::Instant;
@@ -322,7 +321,6 @@ impl AffineBody {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn project_rod_shape_pair(
     first: &mut AffineBody,
@@ -372,7 +370,6 @@ fn project_rod_shapes<
     projected_rod_endpoints: &mut [DVec3],
 ) {
     debug_assert_eq!(projected_rod_endpoints.len(), rods.len() * 2);
-    #[cfg(not(target_arch = "wasm32"))]
     if PAIR_ROD_POLAR && POLAR_ITERATIONS == 2 && DIVISION_FREE_FINAL && FUSED_ROD_GEOMETRY {
         let paired_rod_count = rods.len() & !1;
         let (paired_rods, tail_rods) = rods.split_at_mut(paired_rod_count);
@@ -3402,7 +3399,6 @@ fn rod_deformation_gradient(points: &[DVec3; 4]) -> DMat3 {
     )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy)]
 struct DVec3x2 {
     x: DVec2,
@@ -3410,7 +3406,6 @@ struct DVec3x2 {
     z: DVec2,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl DVec3x2 {
     #[inline(always)]
     fn from_lanes(first: DVec3, second: DVec3) -> Self {
@@ -3480,7 +3475,6 @@ impl DVec3x2 {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy)]
 struct DMat3x2 {
     x_axis: DVec3x2,
@@ -3488,7 +3482,6 @@ struct DMat3x2 {
     z_axis: DVec3x2,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl DMat3x2 {
     #[inline(always)]
     fn from_lanes(first: DMat3, second: DMat3) -> Self {
@@ -3516,7 +3509,6 @@ impl DMat3x2 {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FinalPolarBranch {
     Skip,
@@ -3524,7 +3516,6 @@ enum FinalPolarBranch {
     Negative,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[inline(always)]
 fn final_polar_branch(determinant: f64) -> Option<FinalPolarBranch> {
     if !determinant.is_finite() {
@@ -3538,7 +3529,6 @@ fn final_polar_branch(determinant: f64) -> Option<FinalPolarBranch> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[inline(always)]
 fn normalize_pair(vector: DVec3x2) -> Result<Option<DVec3x2>, ()> {
     let length_squared = vector.dot(vector);
@@ -3553,7 +3543,6 @@ fn normalize_pair(vector: DVec3x2) -> Result<Option<DVec3x2>, ()> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[inline(always)]
 fn orthonormalize_rotation_pair(rotation: DMat3x2) -> Option<DMat3x2> {
     let x = match normalize_pair(rotation.x_axis) {
@@ -3591,7 +3580,6 @@ fn orthonormalize_rotation_pair(rotation: DMat3x2) -> Option<DMat3x2> {
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[inline(always)]
 fn closest_rotation_pair_2(first: DMat3, second: DMat3) -> Option<(DMat3, DMat3)> {
     let mut rotation = DMat3x2::from_lanes(first, second);

@@ -1,3 +1,6 @@
 [alias]
 # Short, deterministic project-solver timing run for all three scenes.
 bench-scenes = "test --no-default-features step_time_scene_ -- --ignored --nocapture --test-threads=1"
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
