@@ -409,6 +409,7 @@ struct SolverScratch {
     constraint_residual: Vec<DVec3>,
     #[cfg(test)]
     solution: Vec<DVec3>,
+    #[cfg(test)]
     joint_hub: Vec<u32>,
     #[cfg(test)]
     rod_inverse_weight: Vec<f64>,
@@ -429,6 +430,7 @@ impl SolverScratch {
             constraint_residual: vec![DVec3::ZERO; joints.len()],
             #[cfg(test)]
             solution: vec![DVec3::ZERO; joints.len()],
+            #[cfg(test)]
             joint_hub: joints
                 .iter()
                 .map(|joint| u32::try_from(joint.b.body).expect("hub index must fit in u32"))
@@ -561,7 +563,7 @@ impl NetSimulation {
             }
         }
 
-        debug_validate_direct_solver_topology(&bodies, &joints);
+        debug_validate_direct_solver_topology(&bodies, &joints, grid_size);
         let hub_count = grid_size * grid_size;
         let solver_scratch = SolverScratch::new(bodies.len(), &joints, hub_count);
 
@@ -2132,20 +2134,38 @@ fn compute_joint_residuals_generic(
 }
 
 #[cfg(debug_assertions)]
-fn debug_validate_direct_solver_topology(bodies: &[AffineBody], joints: &[BallJoint]) {
+fn debug_validate_direct_solver_topology(
+    bodies: &[AffineBody],
+    joints: &[BallJoint],
+    grid_size: usize,
+) {
     let mut rod_endpoint_counts = vec![[0_u8; 2]; bodies.len()];
     let hub_count = bodies
         .iter()
         .take_while(|body| matches!(body.kind, BodyKind::Hub { .. }))
         .count();
+    debug_assert_eq!(hub_count, grid_size * grid_size);
 
     debug_assert_eq!(joints.len() % 2, 0);
+    let horizontal_rod_count = grid_size * (grid_size - 1);
     for (rod_offset, pair) in joints.chunks_exact(2).enumerate() {
         let rod = hub_count + rod_offset;
         debug_assert_eq!(pair[0].a.body, rod);
         debug_assert_eq!(pair[0].a.weights, ROD_START);
         debug_assert_eq!(pair[1].a.body, rod);
         debug_assert_eq!(pair[1].a.weights, ROD_END);
+        let (start_hub, end_hub) = if rod_offset < horizontal_rod_count {
+            let row = rod_offset / (grid_size - 1);
+            let column = rod_offset % (grid_size - 1);
+            let start = row * grid_size + column;
+            (start, start + 1)
+        } else {
+            let vertical_rod = rod_offset - horizontal_rod_count;
+            let start = vertical_rod;
+            (start, start + grid_size)
+        };
+        debug_assert_eq!(pair[0].b.body, start_hub);
+        debug_assert_eq!(pair[1].b.body, end_hub);
     }
 
     for joint in joints {
@@ -2180,7 +2200,12 @@ fn debug_validate_direct_solver_topology(bodies: &[AffineBody], joints: &[BallJo
 }
 
 #[cfg(not(debug_assertions))]
-fn debug_validate_direct_solver_topology(_bodies: &[AffineBody], _joints: &[BallJoint]) {}
+fn debug_validate_direct_solver_topology(
+    _bodies: &[AffineBody],
+    _joints: &[BallJoint],
+    _grid_size: usize,
+) {
+}
 
 #[cfg(test)]
 fn solve_dual_direct(scratch: &mut SolverScratch, grid_size: usize) {
@@ -2245,7 +2270,6 @@ fn project_joint_constraints_direct(
     debug_assert_eq!(hub_count, grid_size * grid_size);
     let SolverScratch {
         constraint_residual: endpoint_or_residual,
-        joint_hub,
         hub_weighted_residual: hub_center_or_delta,
         hub_delta_scale,
         ..
@@ -2295,7 +2319,6 @@ fn project_joint_constraints_direct(
     }
 
     let constraint_residual = endpoint_or_residual.as_slice();
-    let joint_hub = joint_hub.as_slice();
     let hub_delta = hub_center_or_delta.as_slice();
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2307,19 +2330,44 @@ fn project_joint_constraints_direct(
             let hub_task_count = (thread_count / 3).max(1);
             let rod_task_count = thread_count.saturating_sub(hub_task_count).max(1);
             let hubs_per_task = hub_count.div_ceil(hub_task_count);
-            let rods_per_task = rod_count.div_ceil(rod_task_count);
+            let target_rods_per_task = rod_count.div_ceil(rod_task_count);
+            let horizontal_rows_per_task = target_rods_per_task.div_ceil(grid_size - 1);
+            let vertical_rows_per_task = target_rods_per_task.div_ceil(grid_size);
+            let (horizontal_rods, vertical_rods) = rods.split_at_mut(horizontal_rod_count);
+            let (horizontal_residuals, vertical_residuals) =
+                constraint_residual.split_at(horizontal_rod_count * 2);
             task_pool.scope(|scope| {
-                for (task_index, rod_chunk) in rods.chunks_mut(rods_per_task).enumerate() {
-                    let first_rod = task_index * rods_per_task;
-                    let end_rod = (first_rod + rods_per_task).min(rod_count);
-                    let residual_chunk = &constraint_residual[first_rod * 2..end_rod * 2];
-                    let hub_chunk = &joint_hub[first_rod * 2..end_rod * 2];
+                let horizontal_rods_per_task = horizontal_rows_per_task * (grid_size - 1);
+                for (task_index, (rod_chunk, residual_chunk)) in horizontal_rods
+                    .chunks_mut(horizontal_rods_per_task)
+                    .zip(horizontal_residuals.chunks(horizontal_rods_per_task * 2))
+                    .enumerate()
+                {
+                    let first_row = task_index * horizontal_rows_per_task;
                     scope.spawn(async move {
-                        project_rod_joint_constraints(
+                        project_horizontal_rod_joint_constraints(
                             rod_chunk,
                             residual_chunk,
-                            hub_chunk,
                             hub_delta,
+                            grid_size,
+                            first_row,
+                        );
+                    });
+                }
+                let vertical_rods_per_task = vertical_rows_per_task * grid_size;
+                for (task_index, (rod_chunk, residual_chunk)) in vertical_rods
+                    .chunks_mut(vertical_rods_per_task)
+                    .zip(vertical_residuals.chunks(vertical_rods_per_task * 2))
+                    .enumerate()
+                {
+                    let first_row = task_index * vertical_rows_per_task;
+                    scope.spawn(async move {
+                        project_vertical_rod_joint_constraints(
+                            rod_chunk,
+                            residual_chunk,
+                            hub_delta,
+                            grid_size,
+                            first_row,
                         );
                     });
                 }
@@ -2337,7 +2385,7 @@ fn project_joint_constraints_direct(
     }
 
     apply_hub_joint_deltas(hubs, hub_delta);
-    project_rod_joint_constraints(rods, constraint_residual, joint_hub, hub_delta);
+    project_rod_joint_constraints_structured(rods, constraint_residual, hub_delta, grid_size);
 }
 
 #[inline]
@@ -2352,7 +2400,110 @@ fn apply_hub_joint_deltas(hubs: &mut [AffineBody], hub_delta: &[DVec3]) {
 }
 
 #[inline]
-fn project_rod_joint_constraints(
+fn apply_rod_joint_deltas(
+    rod: &mut AffineBody,
+    residual_pair: &[DVec3],
+    start_hub_delta: DVec3,
+    end_hub_delta: DVec3,
+) {
+    let start_correction = residual_pair[0] - start_hub_delta;
+    let end_correction = residual_pair[1] - end_hub_delta;
+    rod.positions[0] -= start_correction;
+    rod.positions[1] -= start_correction;
+    rod.positions[2] -= end_correction;
+    rod.positions[3] -= end_correction;
+}
+
+#[inline]
+fn project_horizontal_rod_joint_constraints(
+    rods: &mut [AffineBody],
+    residuals: &[DVec3],
+    hub_delta: &[DVec3],
+    grid_size: usize,
+    first_row: usize,
+) {
+    let rods_per_row = grid_size - 1;
+    debug_assert_eq!(rods.len() % rods_per_row, 0);
+    debug_assert_eq!(residuals.len(), rods.len() * 2);
+
+    for (row_offset, (rod_row, residual_row)) in rods
+        .chunks_exact_mut(rods_per_row)
+        .zip(residuals.chunks_exact(rods_per_row * 2))
+        .enumerate()
+    {
+        let hub_start = (first_row + row_offset) * grid_size;
+        let hub_row = &hub_delta[hub_start..hub_start + grid_size];
+        for ((rod, residual_pair), hub_pair) in rod_row
+            .iter_mut()
+            .zip(residual_row.chunks_exact(2))
+            .zip(hub_row.windows(2))
+        {
+            apply_rod_joint_deltas(rod, residual_pair, hub_pair[0], hub_pair[1]);
+        }
+    }
+}
+
+#[inline]
+fn project_vertical_rod_joint_constraints(
+    rods: &mut [AffineBody],
+    residuals: &[DVec3],
+    hub_delta: &[DVec3],
+    grid_size: usize,
+    first_row: usize,
+) {
+    debug_assert_eq!(rods.len() % grid_size, 0);
+    debug_assert_eq!(residuals.len(), rods.len() * 2);
+
+    for (row_offset, (rod_row, residual_row)) in rods
+        .chunks_exact_mut(grid_size)
+        .zip(residuals.chunks_exact(grid_size * 2))
+        .enumerate()
+    {
+        let hub_start = (first_row + row_offset) * grid_size;
+        let start_hub_row = &hub_delta[hub_start..hub_start + grid_size];
+        let end_hub_row = &hub_delta[hub_start + grid_size..hub_start + 2 * grid_size];
+        for (((rod, residual_pair), &start_hub_delta), &end_hub_delta) in rod_row
+            .iter_mut()
+            .zip(residual_row.chunks_exact(2))
+            .zip(start_hub_row)
+            .zip(end_hub_row)
+        {
+            apply_rod_joint_deltas(rod, residual_pair, start_hub_delta, end_hub_delta);
+        }
+    }
+}
+
+#[inline]
+fn project_rod_joint_constraints_structured(
+    rods: &mut [AffineBody],
+    residuals: &[DVec3],
+    hub_delta: &[DVec3],
+    grid_size: usize,
+) {
+    let horizontal_rod_count = grid_size * (grid_size - 1);
+    debug_assert_eq!(rods.len(), horizontal_rod_count * 2);
+    debug_assert_eq!(residuals.len(), rods.len() * 2);
+    let (horizontal_rods, vertical_rods) = rods.split_at_mut(horizontal_rod_count);
+    let (horizontal_residuals, vertical_residuals) = residuals.split_at(horizontal_rod_count * 2);
+    project_horizontal_rod_joint_constraints(
+        horizontal_rods,
+        horizontal_residuals,
+        hub_delta,
+        grid_size,
+        0,
+    );
+    project_vertical_rod_joint_constraints(
+        vertical_rods,
+        vertical_residuals,
+        hub_delta,
+        grid_size,
+        0,
+    );
+}
+
+#[cfg(test)]
+#[inline]
+fn project_rod_joint_constraints_reference(
     rods: &mut [AffineBody],
     residuals: &[DVec3],
     joint_hubs: &[u32],
@@ -2363,12 +2514,12 @@ fn project_rod_joint_constraints(
         .zip(residuals.chunks_exact(2))
         .zip(joint_hubs.chunks_exact(2))
     {
-        let start_correction = residual_pair[0] - hub_delta[hub_pair[0] as usize];
-        let end_correction = residual_pair[1] - hub_delta[hub_pair[1] as usize];
-        rod.positions[0] -= start_correction;
-        rod.positions[1] -= start_correction;
-        rod.positions[2] -= end_correction;
-        rod.positions[3] -= end_correction;
+        apply_rod_joint_deltas(
+            rod,
+            residual_pair,
+            hub_delta[hub_pair[0] as usize],
+            hub_delta[hub_pair[1] as usize],
+        );
     }
 }
 
@@ -3382,7 +3533,7 @@ mod tests {
                 let (residual_hubs, remaining) = residual_bodies.split_at_mut(hub_count);
                 let residual_rods = &mut remaining[..rod_count];
                 apply_hub_joint_deltas(residual_hubs, &expected_delta);
-                project_rod_joint_constraints(
+                project_rod_joint_constraints_reference(
                     residual_rods,
                     &expected_residual,
                     &residual_scratch.joint_hub,
@@ -3613,6 +3764,98 @@ mod tests {
             expected_hub_residual
         );
         assert_eq!(simulation.solver_scratch.solution, expected_solution);
+    }
+
+    #[test]
+    fn structured_rod_correction_matches_joint_lookup_exactly() {
+        for grid_size in [2, 10, 25, 50, 100] {
+            for scene in [
+                DemoScene::JointGrid,
+                DemoScene::CylinderDrape,
+                DemoScene::FallingBalls,
+            ] {
+                let simulation = NetSimulation::with_grid_size(scene, grid_size);
+                let hub_count = grid_size * grid_size;
+                let rod_count = simulation.joints.len() / 2;
+                let rods = &simulation.bodies[hub_count..hub_count + rod_count];
+                let residuals: Vec<_> = (0..rod_count * 2)
+                    .map(|index| {
+                        DVec3::new(
+                            ((index * 17) % 31) as f64 - 15.0,
+                            ((index * 29) % 37) as f64 - 18.0,
+                            ((index * 43) % 47) as f64 - 23.0,
+                        ) * 1.0e-5
+                    })
+                    .collect();
+                let hub_delta: Vec<_> = (0..hub_count)
+                    .map(|index| {
+                        DVec3::new(
+                            ((index * 13) % 19) as f64 - 9.0,
+                            ((index * 23) % 29) as f64 - 14.0,
+                            ((index * 31) % 41) as f64 - 20.0,
+                        ) * 1.0e-6
+                    })
+                    .collect();
+
+                let mut structured = rods.to_vec();
+                let mut reference = rods.to_vec();
+                project_rod_joint_constraints_structured(
+                    &mut structured,
+                    &residuals,
+                    &hub_delta,
+                    grid_size,
+                );
+                project_rod_joint_constraints_reference(
+                    &mut reference,
+                    &residuals,
+                    &simulation.solver_scratch.joint_hub,
+                    &hub_delta,
+                );
+                for (structured, reference) in structured.iter().zip(&reference) {
+                    assert_eq!(structured.positions, reference.positions);
+                }
+
+                let horizontal_rod_count = grid_size * (grid_size - 1);
+                let mut row_chunked = rods.to_vec();
+                let (horizontal_rods, vertical_rods) =
+                    row_chunked.split_at_mut(horizontal_rod_count);
+                let (horizontal_residuals, vertical_residuals) =
+                    residuals.split_at(horizontal_rod_count * 2);
+                let horizontal_rows_per_chunk = 3;
+                let horizontal_rods_per_chunk = horizontal_rows_per_chunk * (grid_size - 1);
+                for (chunk, (rod_chunk, residual_chunk)) in horizontal_rods
+                    .chunks_mut(horizontal_rods_per_chunk)
+                    .zip(horizontal_residuals.chunks(horizontal_rods_per_chunk * 2))
+                    .enumerate()
+                {
+                    project_horizontal_rod_joint_constraints(
+                        rod_chunk,
+                        residual_chunk,
+                        &hub_delta,
+                        grid_size,
+                        chunk * horizontal_rows_per_chunk,
+                    );
+                }
+                let vertical_rows_per_chunk = 4;
+                let vertical_rods_per_chunk = vertical_rows_per_chunk * grid_size;
+                for (chunk, (rod_chunk, residual_chunk)) in vertical_rods
+                    .chunks_mut(vertical_rods_per_chunk)
+                    .zip(vertical_residuals.chunks(vertical_rods_per_chunk * 2))
+                    .enumerate()
+                {
+                    project_vertical_rod_joint_constraints(
+                        rod_chunk,
+                        residual_chunk,
+                        &hub_delta,
+                        grid_size,
+                        chunk * vertical_rows_per_chunk,
+                    );
+                }
+                for (chunked, reference) in row_chunked.iter().zip(&reference) {
+                    assert_eq!(chunked.positions, reference.positions);
+                }
+            }
+        }
     }
 
     #[test]
