@@ -3,6 +3,8 @@
 A focused proof-of-concept implementation of the ball-joint nets from
 *M-ABD: Scalable, Efficient, and Robust Multi-Affine-Body Dynamics*.
 
+![M-ABD and PhysX comparison application](screenshot.png)
+
 The application has three scenes that can be changed at runtime. Each scene can
 run the project's M-ABD-inspired solver or, when the PhysX backend is enabled,
 an independently constructed PhysX version. Changing the scene, changing the
