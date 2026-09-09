@@ -1,7 +1,7 @@
 # M-ABD and PhysX comparison
 
 A focused proof-of-concept implementation of the ball-joint nets from
-*M-ABD: Scalable, Efficient, and Robust Multi-Affine-Body Dynamics*.
+[*M-ABD: Scalable, Efficient, and Robust Multi-Affine-Body Dynamics*](https://arxiv.org/abs/2603.08079).
 
 ![M-ABD and PhysX comparison application](screenshot.png)
 
